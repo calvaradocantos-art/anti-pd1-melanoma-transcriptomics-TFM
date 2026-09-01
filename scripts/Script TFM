@@ -1,0 +1,6090 @@
+############################################################
+# TFM: Biomarcadores transcriptómicos de respuesta anti-PD-1
+# Dataset principal: GSE91061
+# Dataset de evaluación de reproducibilidad y priorización: GSE78220
+# Dataset de evaluación externa retrospectiva in silico: GSE145996
+# Objetivo: preparar datos, analizar DEGs y priorizar candidatos
+############################################################
+
+############################################################
+# 0. INSTALACIÓN Y CARGA DE PAQUETES
+# Se cargan paquetes para descargar datos GEO, analizar RNA-seq,
+# visualizar resultados y realizar enriquecimiento funcional.
+############################################################
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+
+# Instalar solo si no están previamente instalados
+packages_bioc <- c(
+  "GEOquery", "DESeq2", "AnnotationDbi",
+  "org.Hs.eg.db", "clusterProfiler", "apeglm"
+)
+
+packages_cran <- c(
+  "tidyverse", "pheatmap", "EnhancedVolcano", "readxl",
+  "pROC", "rlang"
+)
+
+for (pkg in packages_bioc) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg)
+  }
+}
+
+for (pkg in packages_cran) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+library(GEOquery)
+library(DESeq2)
+library(tidyverse)
+library(pheatmap)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(EnhancedVolcano)
+library(apeglm)
+library(readxl)
+library(pROC)
+library(dplyr)
+library(ggplot2)
+
+############################################################
+# 1. DESCARGA DE METADATOS DE GSE91061
+# getGEO descarga los metadatos de la serie.
+# En este dataset la matriz de expresión no viene cargada en exprs(eset),
+# por eso se descargan archivos suplementarios con getGEOSuppFiles().
+############################################################
+            
+gse <- getGEO("GSE91061", GSEMatrix = TRUE, getGPL = FALSE)
+eset <- gse[[1]]
+meta_raw <- pData(eset)
+
+# Ver estructura general de metadatos
+dim(meta_raw)
+colnames(meta_raw)
+head(meta_raw[, 1:6])
+
+############################################################
+# 2. DESCARGA Y LECTURA DE CONTEOS CRUDOS
+# Para DESeq2 se usan conteos crudos, no FPKM ni TPM.
+# row.names = 1 indica que la primera columna contiene IDs de genes.
+############################################################
+
+getGEOSuppFiles("GSE91061")
+
+# Revisar archivos descargados
+list.files("GSE91061", recursive = TRUE)
+
+# Leer archivo de conteos crudos
+counts <- read.csv(
+  "GSE91061/GSE91061_BMS038109Sample.hg19KnownGene.raw.csv.gz",
+  row.names = 1,
+  check.names = FALSE
+)
+
+# Comprobar dimensiones y estructura
+dim(counts)
+head(rownames(counts))
+head(colnames(counts))
+counts[1:5, 1:5]
+
+# Convertir a matriz
+counts_mat <- as.matrix(counts)
+
+# Verificar que todos los valores sean numéricos
+stopifnot(is.numeric(counts_mat))
+
+# Verificar que no existan NA
+stopifnot(!anyNA(counts_mat))
+
+# Verificar que los datos sean conteos enteros y no negativos
+stopifnot(all(counts_mat >= 0))
+stopifnot(all(counts_mat == round(counts_mat)))
+
+# Solo después convertir explícitamente
+storage.mode(counts_mat) <- "integer"
+
+############################################################
+# 3. ALINEACIÓN ENTRE CONTEOS Y METADATOS
+# Las columnas de counts_mat deben coincidir con las filas de metadatos.
+# En GSE91061 los nombres de las columnas suelen coincidir con meta_raw$title.
+############################################################
+
+sum(colnames(counts_mat) %in% meta_raw$title)
+all(colnames(counts_mat) %in% meta_raw$title)
+
+# Filtrar metadatos a muestras presentes en la matriz
+meta_counts <- meta_raw[meta_raw$title %in% colnames(counts_mat), ]
+
+# Reordenar metadatos para que coincidan con columnas de counts_mat
+meta_counts <- meta_counts[match(colnames(counts_mat), meta_counts$title), ]
+
+# Comprobación obligatoria
+stopifnot(all(colnames(counts_mat) == meta_counts$title))
+
+############################################################
+# 4. INSPECCIÓN Y PREPARACIÓN INICIAL DE METADATOS CLÍNICOS
+#
+# En este apartado se inspecciona la estructura de los
+# metadatos clínicos asociados a las muestras de GSE91061
+# y se construye una tabla inicial para el análisis.
+#
+# Las columnas "characteristics" se exploran únicamente
+# para conocer la información clínica disponible en GEO.
+#
+# Esta inspección es exploratoria y no determina
+# automáticamente la variable utilizada como respuesta.
+# La columna definitiva de respuesta clínica será definida
+# y verificada explícitamente en el apartado 5.
+############################################################
+
+# ----------------------------------------------------------
+# 4.1. Inspección de columnas de características clínicas
+# ----------------------------------------------------------
+
+char_cols <- grep(
+  "characteristics",
+  colnames(meta_counts),
+  value = TRUE
+)
+
+cat("\nColumnas characteristics disponibles:\n")
+print(char_cols)
+
+
+# Mostrar una vista inicial
+head(meta_counts[, char_cols,
+    drop = FALSE
+  ]
+)
+
+
+# ----------------------------------------------------------
+# 4.2. Construcción de la tabla clínica inicial
+#
+# Se crea meta_clean a partir de los metadatos correspondientes
+# a las muestras presentes en la matriz de conteos.
+#
+# sample_id permite identificar cada muestra.
+# timepoint diferencia las muestras pretratamiento (Pre)
+# de las obtenidas durante el tratamiento (On).
+# ----------------------------------------------------------
+
+meta_clean <- meta_counts %>%
+  as.data.frame() %>%
+  mutate(
+    sample_id = title,
+    timepoint = case_when(
+      str_detect(title, "_Pre_") ~ "Pre",
+      str_detect(title, "_On_")  ~ "On",
+      TRUE ~ NA_character_
+    )
+  )
+
+
+# ----------------------------------------------------------
+# 4.4. Exploración del contenido clínico de characteristics
+#
+# Se muestran los valores únicos presentes en estas columnas
+# para documentar la estructura de los metadatos clínicos.
+#
+# Esta exploración permite observar información como:
+# - momento de obtención de la muestra;
+# - respuesta clínica;
+# - tipo de tejido.
+#
+# La variable de respuesta utilizada en el análisis será
+# definida explícitamente en el apartado 5.
+# ----------------------------------------------------------
+
+for (cc in char_cols) {
+  cat("\n\n---", cc, "---\n")
+  print(unique(meta_clean[[cc]])[1:20])
+}
+
+
+############################################################
+# 5. DEFINICIÓN DE LA RESPUESTA CLÍNICA
+#
+# Según Riaz et al. (2017), la respuesta al nivolumab se evaluó
+# mediante RECIST v1.1 y se registró como mejor respuesta global.
+#
+# Para el análisis transcriptómico predictivo principal:
+#
+#   CR = Complete Response
+#   PR = Partial Response
+#   SD = Stable Disease
+#   PD = Progressive Disease
+#
+# Clasificación utilizada en este TFM:
+#
+#   CR / PR  -> Responder
+#   PD       -> NonResponder
+#   SD       -> se conserva como categoría clínica,
+#               pero se excluye del contraste binario principal.
+#
+# Esto permite reproducir conceptualmente la comparación
+# pretratamiento CR/PR vs PD utilizada en el estudio original.
+#
+# Tras revisar la estructura completa de los metadatos de
+# GSE91061 y verificar manualmente la información clínica,
+# se identificó "response:ch1" como la columna que contiene
+# la variable de respuesta utilizada en este análisis.
+#
+# La existencia de esta columna se comprueba antes de
+# continuar con la recodificación.
+############################################################
+
+# ----------------------------------------------------------
+# 5.1. Indicar la columna real de respuesta en GSE91061
+# ----------------------------------------------------------
+
+response_column <- "response:ch1"
+
+# Comprobar que la columna realmente existe.
+# Si no existe, el código se detendrá y evitará continuar
+# con una clasificación clínica incorrecta.
+
+stopifnot(response_column %in% colnames(meta_clean))
+
+
+# ----------------------------------------------------------
+# 5.2. Revisar primero los valores originales
+# ----------------------------------------------------------
+
+# Es importante observar cómo GEO escribió realmente las
+# categorías antes de transformarlas.
+
+cat("\nValores originales encontrados en la variable de respuesta:\n")
+
+print(
+  table(meta_clean[[response_column]], useNA = "ifany")
+)
+
+
+# ----------------------------------------------------------
+# 5.3. Extraer CR/PR/SD/PD de los metadatos
+# ----------------------------------------------------------
+
+meta_clean <- meta_clean %>%
+  mutate(
+    
+    # Conservamos el texto original exactamente como aparece
+    # en GEO. Esto es útil para trazabilidad y para documentar
+    # posteriormente cómo se realizó la recodificación.
+    response_text = as.character(.data[[response_column]]),
+    
+    # Eliminamos espacios innecesarios.
+    response_text = str_squish(response_text),
+    
+    # Eliminamos el prefijo "response:" si está presente.
+    # Por ejemplo:
+    #
+    # "response: CR/PR" -> "CR/PR"
+    # "response: SD"    -> "SD"
+    # "response: PD"    -> "PD"
+    #
+    response_code = str_remove(
+      response_text,
+      regex("^response\\s*:\\s*", ignore_case = TRUE)
+    ),
+    
+    # Convertimos todo a mayúsculas para evitar problemas
+    # derivados de diferencias de escritura.
+    response_code = str_to_upper(str_trim(response_code))
+  )
+
+
+# ----------------------------------------------------------
+# 5.4. Normalizar las categorías clínicas reales de GSE91061
+#
+# IMPORTANTE:
+# Se reconstruye response_code directamente desde response_text
+# para evitar que una recodificación anterior haya convertido
+# valores como PRCR en NA.
+#
+# Valores reales observados en GSE91061:
+#
+# PRCR = Complete Response / Partial Response
+# SD   = Stable Disease
+# PD   = Progressive Disease
+# UNK  = respuesta desconocida
+#
+# Recodificación utilizada:
+#
+# PRCR -> CR/PR
+# SD   -> SD
+# PD   -> PD
+# UNK  -> NA
+# ----------------------------------------------------------
+
+meta_clean <- meta_clean %>%
+  mutate(
+    
+    # Volvemos a partir del dato clínico original
+    response_original = str_to_upper(
+      str_trim(
+        str_remove(
+          response_text,
+          regex("^response\\s*:\\s*", ignore_case = TRUE)
+        )
+      )
+    ),
+    
+    # Recodificación clínica
+    response_code = case_when(
+      
+      response_original == "PRCR" ~ "CR/PR",
+      
+      response_original == "PD" ~ "PD",
+      
+      response_original == "SD" ~ "SD",
+      
+      response_original == "UNK" ~ NA_character_,
+      
+      TRUE ~ NA_character_
+    )
+  )
+
+cat("\nValores originales recuperados:\n")
+
+print(
+  table(
+    meta_clean$response_original,
+    useNA = "ifany"
+  )
+)
+
+# ----------------------------------------------------------
+# 5.5. Comprobar las categorías clínicas obtenidas
+# ----------------------------------------------------------
+
+cat("\nCategorías clínicas después de la limpieza:\n")
+
+print(
+  table(
+    meta_clean$response_code,
+    useNA = "ifany"
+  )
+)
+
+
+
+# ----------------------------------------------------------
+# 5.6. Crear grupos para el análisis transcriptómico
+#
+# CR/PR -> Responder
+# PD    -> NonResponder
+# SD    -> excluido del contraste binario
+# UNK   -> excluido por respuesta desconocida
+# ----------------------------------------------------------
+
+meta_clean <- meta_clean %>%
+  mutate(
+    response_group = case_when(
+      
+      response_code == "CR/PR" ~ "Responder",
+      
+      response_code == "PD" ~ "NonResponder",
+      
+      response_code == "SD" ~ NA_character_,
+      
+      TRUE ~ NA_character_
+    )
+  )
+
+
+# ----------------------------------------------------------
+# 5.7. Comprobar que la clasificación es correcta
+# ----------------------------------------------------------
+
+# Esta tabla es especialmente importante porque permite comprobar
+# que ninguna categoría clínica fue asignada incorrectamente.
+
+cat("\nCorrespondencia entre respuesta clínica y grupo analítico:\n")
+
+print(
+  table(
+    meta_clean$response_code,
+    meta_clean$response_group,
+    useNA = "ifany"
+  )
+)
+
+
+############################################################
+# 6. SELECCIÓN DE LA COHORTE ANALÍTICA PRINCIPAL
+#
+# Se utilizarán exclusivamente muestras PRETRATAMIENTO.
+#
+# Justificación:
+# queremos identificar perfiles transcriptómicos presentes
+# antes de administrar nivolumab que puedan estar asociados
+# con la respuesta posterior.
+#
+# Se excluyen:
+#
+# - muestras On-treatment
+# - pacientes con SD para el contraste binario principal
+# - muestras sin respuesta clínica definida
+############################################################
+
+# ----------------------------------------------------------
+# 6.1. Obtener identificador del paciente
+# ----------------------------------------------------------
+
+# Los nombres de las muestras presentan formatos como:
+#
+# Pt1_Pre_AD101148-6
+# Pt10_Pre_...
+#
+# Por ello extraemos "Pt1", "Pt10", etc.
+#
+# Esto permitirá contar PACIENTES y no solamente muestras.
+
+meta_clean <- meta_clean %>%
+  mutate(
+    patient_id = str_extract(
+      sample_id,
+      regex("^Pt\\d+", ignore_case = TRUE)
+    )
+  )
+
+
+# Comprobar que se pudo obtener patient_id
+cat("\nNúmero de muestras sin identificador de paciente:\n")
+print(sum(is.na(meta_clean$patient_id)))
+
+
+# ----------------------------------------------------------
+# 6.2. Revisar distribución completa antes de filtrar
+# ----------------------------------------------------------
+
+cat("\nRespuesta según momento de muestreo:\n")
+
+print(
+  table(
+    meta_clean$timepoint,
+    meta_clean$response_code,
+    useNA = "ifany"
+  )
+)
+
+
+# ----------------------------------------------------------
+# 6.3. Seleccionar exclusivamente muestras Pre
+#      y CR/PR frente a PD
+# ----------------------------------------------------------
+
+meta_final <- meta_clean %>%
+  filter(
+    timepoint == "Pre",
+    response_code %in% c(
+      "CR/PR",
+      "PD"
+    ),
+    !is.na(response_group)
+  )
+
+# ----------------------------------------------------------
+# 6.4. COMPROBAR CONSISTENCIA PACIENTE-RESPUESTA
+#
+# Se verifica que ningún paciente haya quedado asociado
+# simultáneamente a Responder y NonResponder.
+# ----------------------------------------------------------
+
+patient_response_check <- meta_final %>%
+  distinct(patient_id, response_group) %>%
+  count(patient_id, name = "n_response_groups") %>%
+  filter(n_response_groups > 1)
+
+cat("\nPacientes asociados a más de un grupo de respuesta:\n")
+print(patient_response_check)
+
+# Si existe algún paciente con dos grupos distintos,
+# el código se detiene porque sería una inconsistencia clínica.
+stopifnot(nrow(patient_response_check) == 0)
+
+
+# ----------------------------------------------------------
+# 6.5. COMPROBAR CUÁNTOS PACIENTES QUEDAN
+# ----------------------------------------------------------
+
+# Primero contamos muestras.
+# Esto NO necesariamente equivale al número de pacientes.
+
+cat("\nNúmero de muestras por grupo:\n")
+
+sample_summary <- meta_final %>%
+  count(response_group, name = "n_samples")
+
+print(sample_summary)
+
+
+# Ahora contamos pacientes únicos.
+# Esta es la cifra epidemiológica/analítica más importante.
+
+cat("\nNúmero de pacientes únicos por grupo:\n")
+
+patient_summary <- meta_final %>%
+  distinct(patient_id, response_group) %>%
+  count(response_group, name = "n_patients")
+
+print(patient_summary)
+
+
+# Número total de pacientes incluidos
+cat("\nNúmero total de pacientes incluidos en el análisis:\n")
+
+print(
+  n_distinct(meta_final$patient_id)
+)
+
+
+# ----------------------------------------------------------
+# 6.6. COMPROBAR SI ALGÚN PACIENTE TIENE MÁS DE UNA
+#      MUESTRA PRETRATAMIENTO
+#
+# Esto es importante porque DESeq2 presupone observaciones
+# independientes si no se modela explícitamente el paciente.
+# ----------------------------------------------------------
+
+duplicate_patients <- meta_final %>%
+  count(patient_id, name = "n_pre_samples") %>%
+  filter(n_pre_samples > 1)
+
+cat("\nPacientes con más de una muestra Pre incluida:\n")
+
+print(duplicate_patients)
+
+
+if (nrow(duplicate_patients) > 0) {
+  
+  warning(
+    "Existen pacientes con más de una muestra Pre. ",
+    "Debe revisarse esta situación antes del análisis diferencial ",
+    "para evitar tratar biopsias del mismo paciente como observaciones independientes."
+  )
+  
+} else {
+  
+  cat(
+    "\nCada paciente aporta una única muestra Pre al análisis principal.\n"
+  )
+}
+
+
+# ----------------------------------------------------------
+# 6.7. COMPROBAR QUE TODAS LAS MUESTRAS SE ENCUENTRAN
+#      EN LA MATRIZ DE CONTEOS
+# ----------------------------------------------------------
+
+stopifnot(
+  all(meta_final$sample_id %in% colnames(counts_mat))
+)
+
+
+# ----------------------------------------------------------
+# 6.8. CREAR MATRIZ DE CONTEOS DEFINITIVA
+# ----------------------------------------------------------
+
+# Conservamos únicamente las columnas correspondientes a
+# los pacientes seleccionados.
+
+counts_final <- counts_mat[
+  ,
+  meta_final$sample_id,
+  drop = FALSE
+]
+
+
+# ----------------------------------------------------------
+# 6.9. DEFINIR LOS NOMBRES DE FILA DEL METADATA
+# ----------------------------------------------------------
+
+rownames(meta_final) <- meta_final$sample_id
+
+
+# ----------------------------------------------------------
+# 6.10. COMPROBACIÓN CRÍTICA DE CORRESPONDENCIA
+# ----------------------------------------------------------
+# DESeq2 exige que:
+#
+# columnas de countData
+# =
+# filas de colData
+#
+# y que además tengan exactamente el mismo orden.
+
+stopifnot(
+  all(
+    colnames(counts_final) ==
+      rownames(meta_final)
+  )
+)
+
+cat(
+  "\nCORRECTO: matriz de conteos y metadatos están perfectamente alineados.\n"
+)
+
+
+# ----------------------------------------------------------
+# 6.11. CONVERTIR response_group EN FACTOR
+# ----------------------------------------------------------
+# NonResponder será el nivel de referencia.
+#
+# Por tanto, posteriormente:
+# log2FoldChange > 0
+# indicará mayor expresión en Respondedores
+# cuando realicemos:
+# Responder vs NonResponder
+
+meta_final$response_group <- factor(
+  meta_final$response_group,
+  levels = c(
+    "NonResponder",
+    "Responder"
+  )
+)
+
+
+# ----------------------------------------------------------
+# 6.12. RESUMEN FINAL DE LA COHORTE
+## ----------------------------------------------------------
+
+cat("\n==============================\n")
+cat("COHORTE FINAL PARA DESeq2\n")
+cat("==============================\n\n")
+
+cat(
+  "Número de genes:",
+  nrow(counts_final),
+  "\n"
+)
+
+cat(
+  "Número de muestras:",
+  ncol(counts_final),
+  "\n"
+)
+
+cat(
+  "Número de pacientes:",
+  n_distinct(meta_final$patient_id),
+  "\n\n"
+)
+
+cat("Distribución final por grupo:\n")
+
+print(
+  table(meta_final$response_group)
+)
+
+cat("\nRespuesta clínica original:\n")
+
+print(
+  table(meta_final$response_code)
+)
+
+cat("\nMomento de muestreo:\n")
+
+print(
+  table(meta_final$timepoint)
+)
+
+
+############################################################
+# 7. INSPECCIÓN INICIAL DE CALIDAD
+#
+# Se evalúa la estructura de la matriz de conteos antes del
+# preprocesamiento y análisis diferencial.
+#
+# Se revisan:
+# - dimensiones
+# - valores NA
+# - conteos negativos
+# - proporción de ceros
+# - tamaño de biblioteca por muestra
+# - posibles muestras con comportamiento atípico
+############################################################
+
+
+# ----------------------------------------------------------
+# 7.1. Comprobar dimensiones de la cohorte final
+# ----------------------------------------------------------
+
+dim(counts_final)
+
+cat(
+  "\nNúmero de genes antes del filtrado:",
+  nrow(counts_final),
+  "\n"
+)
+
+cat(
+  "Número de muestras:",
+  ncol(counts_final),
+  "\n"
+)
+
+
+# ----------------------------------------------------------
+# 7.2. Verificar integridad de los conteos
+# ----------------------------------------------------------
+
+stopifnot(!anyNA(counts_final))
+stopifnot(all(counts_final >= 0))
+stopifnot(all(counts_final == round(counts_final)))
+
+cat("\nLos conteos son enteros, no negativos y sin NA.\n")
+
+
+# ----------------------------------------------------------
+# 7.3. Evaluar proporción global de ceros
+# ----------------------------------------------------------
+
+prop_zeros <- mean(counts_final == 0)
+
+cat(
+  "\nProporción global de ceros:",
+  round(prop_zeros, 4),
+  "\n"
+)
+
+
+# ----------------------------------------------------------
+# 7.4. Evaluar proporción de ceros por muestra
+# ----------------------------------------------------------
+
+prop_zeros_sample <- colMeans(counts_final == 0)
+
+summary(prop_zeros_sample)
+
+
+# ----------------------------------------------------------
+# 7.5. Calcular tamaño de biblioteca por muestra
+# ----------------------------------------------------------
+
+library_sizes <- colSums(counts_final)
+
+summary(library_sizes)
+
+
+# ----------------------------------------------------------
+# 7.6. Crear tabla de control de calidad por muestra
+# ----------------------------------------------------------
+
+qc_samples <- data.frame(
+  sample_id = colnames(counts_final),
+  library_size = library_sizes,
+  zero_fraction = prop_zeros_sample,
+  response_group = meta_final$response_group
+)
+
+head(qc_samples)
+
+
+# ----------------------------------------------------------
+# 7.7. Visualizar tamaños de biblioteca
+# ----------------------------------------------------------
+
+barplot(
+  library_sizes,
+  las = 2,
+  cex.names = 0.6,
+  main = "Conteos totales por muestra - GSE91061 Pre",
+  ylab = "Conteos totales"
+)
+
+
+# ----------------------------------------------------------
+# 7.8. Visualizar distribución de tamaños de biblioteca
+# ----------------------------------------------------------
+
+boxplot(
+  library_sizes,
+  main = "Distribución de tamaños de biblioteca",
+  ylab = "Conteos totales"
+)
+
+
+############################################################
+# 8. FILTRADO DE GENES DE BAJA EXPRESIÓN
+#
+# Se eliminan genes con expresión insuficiente para reducir
+# ruido estadístico y pruebas múltiples innecesarias.
+#
+# El número mínimo de muestras se determina según el tamaño
+# del grupo analítico más pequeño.
+############################################################
+
+
+# ----------------------------------------------------------
+# 8.1. Determinar tamaño del grupo más pequeño
+# ----------------------------------------------------------
+
+group_sizes <- table(meta_final$response_group)
+
+group_sizes
+
+min_group_size <- min(group_sizes)
+
+cat(
+  "\nTamaño del grupo más pequeño:",
+  min_group_size,
+  "\n"
+)
+
+
+# ----------------------------------------------------------
+# 8.2. Definir criterio de filtrado
+# ----------------------------------------------------------
+
+# Se conserva un gen si presenta al menos 10 conteos
+# en un número de muestras equivalente al grupo más pequeño.
+
+keep <- rowSums(counts_final >= 10) >= min_group_size
+
+
+# ----------------------------------------------------------
+# 8.3. Aplicar filtrado
+# ----------------------------------------------------------
+
+counts_filt <- counts_final[keep, , drop = FALSE]
+
+
+# ----------------------------------------------------------
+# 8.4. Comparar antes y después
+# ----------------------------------------------------------
+
+cat(
+  "\nGenes antes del filtrado:",
+  nrow(counts_final),
+  "\n"
+)
+
+cat(
+  "Genes después del filtrado:",
+  nrow(counts_filt),
+  "\n"
+)
+
+cat(
+  "Genes eliminados:",
+  nrow(counts_final) - nrow(counts_filt),
+  "\n"
+)
+
+
+# ----------------------------------------------------------
+# 8.5. Verificar integridad de la matriz filtrada
+# ----------------------------------------------------------
+
+stopifnot(!anyNA(counts_filt))
+stopifnot(all(counts_filt >= 0))
+stopifnot(all(counts_filt == round(counts_filt)))
+
+storage.mode(counts_filt) <- "integer"
+
+
+############################################################
+# 9. PREPARACIÓN DEL OBJETO DESEQ2
+############################################################
+
+# ----------------------------------------------------------
+# 9.1. Confirmar nivel de referencia
+# ----------------------------------------------------------
+
+meta_final$response_group <- relevel(
+  meta_final$response_group,
+  ref = "NonResponder"
+)
+
+levels(meta_final$response_group)
+
+
+# ----------------------------------------------------------
+# 9.2. Crear objeto DESeq2
+# ----------------------------------------------------------
+
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_filt,
+  colData = meta_final,
+  design = ~ response_group
+)
+
+############################################################
+# 10. TRANSFORMACIÓN VST Y ANÁLISIS PCA
+#
+# Objetivos:
+# - estabilizar la varianza de los conteos
+# - evaluar la estructura global de las muestras
+# - detectar posibles outliers
+# - observar si Responders y NonResponders presentan
+#   patrones de agrupamiento globales
+#
+# IMPORTANTE:
+# VST NO se utiliza para el análisis diferencial.
+# DESeq2 trabaja con los conteos crudos contenidos en dds.
+# VST se utiliza para análisis exploratorio y visualización.
+############################################################
+
+
+# ----------------------------------------------------------
+# 10.1. Aplicar transformación estabilizadora de varianza
+# ----------------------------------------------------------
+
+# blind = TRUE hace que la transformación no utilice la
+# información del diseño experimental.
+#
+# Es apropiado para explorar la estructura global de las
+# muestras y detectar posibles anomalías sin forzar la
+# separación según response_group.
+
+vsd <- vst(
+  dds,
+  blind = TRUE
+)
+
+
+# Revisar el objeto generado
+vsd
+
+
+# ----------------------------------------------------------
+# 10.2. Extraer matriz de expresión transformada
+# ----------------------------------------------------------
+
+vst_mat <- assay(vsd)
+
+dim(vst_mat)
+
+# Ver una pequeña parte
+vst_mat[1:5, 1:5]
+
+
+############################################################
+# 10.3. COMPROBAR CORRESPONDENCIA CON LOS METADATOS
+############################################################
+
+stopifnot(
+  all(
+    colnames(vst_mat) ==
+      rownames(meta_final)
+  )
+)
+
+cat(
+  "\nCORRECTO: matriz VST y metadatos están alineados.\n"
+)
+
+
+############################################################
+# 10.4. PCA SEGÚN RESPONSE_GROUP
+############################################################
+
+# plotPCA calcula los componentes principales utilizando
+# los genes con mayor variabilidad.
+#
+# returnData = TRUE permite recuperar los datos y construir
+# una figura personalizada con ggplot2.
+
+pca_data <- plotPCA(
+  vsd,
+  intgroup = "response_group",
+  returnData = TRUE
+)
+
+
+# Porcentaje de varianza explicado por PC1 y PC2
+percentVar <- round(
+  100 * attr(pca_data, "percentVar"),
+  1
+)
+
+
+# Revisar tabla PCA
+head(pca_data)
+
+
+############################################################
+# 10.5. GRAFICAR PCA
+############################################################
+
+pca_plot <- ggplot(
+  pca_data,
+  aes(
+    x = PC1,
+    y = PC2,
+    color = response_group
+  )
+) +
+  geom_point(
+    size = 3,
+    alpha = 0.8
+  ) +
+  xlab(
+    paste0(
+      "PC1: ",
+      percentVar[1],
+      "% de varianza"
+    )
+  ) +
+  ylab(
+    paste0(
+      "PC2: ",
+      percentVar[2],
+      "% de varianza"
+    )
+  ) +
+  labs(
+    title = "PCA de muestras pretratamiento - GSE91061",
+    subtitle = "Respondedores vs NonRespondedores",
+    color = "Respuesta"
+  ) +
+  theme_minimal()
+
+
+print(pca_plot)
+
+
+############################################################
+# 10.6. PCA CON IDENTIFICADORES DE PACIENTE
+#
+# Se añaden etiquetas para identificar visualmente posibles
+# muestras alejadas del resto.
+############################################################
+
+# Incorporar patient_id a los datos del PCA
+pca_data$patient_id <- meta_final[
+  rownames(pca_data),
+  "patient_id"
+]
+
+
+pca_labels <- ggplot(
+  pca_data,
+  aes(
+    PC1,
+    PC2,
+    color = response_group,
+    label = patient_id
+  )
+) +
+  geom_point(size = 3) +
+  geom_text(
+    vjust = -0.8,
+    size = 3,
+    check_overlap = TRUE
+  ) +
+  xlab(
+    paste0(
+      "PC1: ",
+      percentVar[1],
+      "% de varianza"
+    )
+  ) +
+  ylab(
+    paste0(
+      "PC2: ",
+      percentVar[2],
+      "% de varianza"
+    )
+  ) +
+  labs(
+    title = "PCA con identificación de pacientes",
+    color = "Respuesta"
+  ) +
+  theme_minimal()
+
+
+print(pca_labels)
+
+
+############################################################
+# 11. EVALUACIÓN EXPLORATORIA DE POSIBLES OUTLIERS
+#
+# Se calcula la distancia de cada muestra respecto al centro
+# de PC1 y PC2.
+#
+# Este análisis sirve para IDENTIFICAR muestras que merecen
+# revisión, no para eliminarlas automáticamente.
+############################################################
+
+# ----------------------------------------------------------
+# 11.1. Calcular distancia respecto al centro del PCA
+# ----------------------------------------------------------
+
+pc1_center <- median(
+  pca_data$PC1,
+  na.rm = TRUE
+)
+
+pc2_center <- median(
+  pca_data$PC2,
+  na.rm = TRUE
+)
+
+
+pca_data <- pca_data %>%
+  mutate(
+    pca_distance = sqrt(
+      (PC1 - pc1_center)^2 +
+        (PC2 - pc2_center)^2
+    )
+  )
+
+
+# ----------------------------------------------------------
+# 11.2. Ordenar muestras según distancia
+# ----------------------------------------------------------
+
+pca_outlier_check <- pca_data %>%
+  arrange(desc(pca_distance)) %>%
+  select(
+    name,
+    patient_id,
+    response_group,
+    PC1,
+    PC2,
+    pca_distance
+  )
+
+
+cat(
+  "\nMuestras más alejadas del centro del PCA:\n"
+)
+
+print(
+  head(
+    pca_outlier_check,
+    10
+  )
+)
+
+
+# ----------------------------------------------------------
+# 11.3. Combinar PCA con información de QC
+#
+# Se asume que qc_samples fue creado en el apartado 7.
+# ----------------------------------------------------------
+
+if (exists("qc_samples")) {
+  
+  pca_qc <- pca_outlier_check %>%
+    rename(
+      sample_id = name
+    ) %>%
+    left_join(
+      qc_samples %>%
+        select(
+          sample_id,
+          library_size,
+          zero_fraction
+        ),
+      by = "sample_id"
+    )
+  
+  cat(
+    "\nPCA combinado con métricas de calidad:\n"
+  )
+  
+  print(
+    head(
+      pca_qc,
+      10
+    )
+  )
+}
+
+
+# ----------------------------------------------------------
+# 11.4. DEFINICIÓN DEL DISEÑO ESTADÍSTICO FINAL
+#
+# Tras revisar PCA, QC y variables clínicas/técnicas,
+# se establece el diseño definitivo antes de ejecutar
+# el análisis diferencial.
+# ----------------------------------------------------------
+
+design(dds) <- ~ response_group
+
+cat("\nDiseño estadístico final utilizado en DESeq2:\n")
+print(design(dds))
+
+
+############################################################
+# 12. ANÁLISIS DE EXPRESIÓN DIFERENCIAL CON DESEQ2
+#
+# Una vez completada la evaluación exploratoria mediante
+# VST/PCA y revisadas posibles muestras atípicas y factores
+# de confusión, se ejecuta el modelo diferencial definitivo.
+#
+# El diseño final debe quedar establecido antes de ejecutar
+# DESeq().
+############################################################
+
+# ----------------------------------------------------------
+# 12.1. Ejecutar modelo de DESeq2
+# ----------------------------------------------------------
+
+dds <- DESeq(dds)
+
+
+# ----------------------------------------------------------
+# 12.2. Revisar nombres de coeficientes disponibles
+# ----------------------------------------------------------
+
+resultsNames(dds)
+
+
+# ----------------------------------------------------------
+# 12.3. Extraer contraste Responder vs NonResponder
+# ----------------------------------------------------------
+
+res_raw <- results(
+  dds,
+  contrast = c(
+    "response_group",
+    "Responder",
+    "NonResponder"
+  ),
+  alpha = 0.05
+)
+
+# Conservar resultados sin shrinkage para análisis GSEA
+# El estadístico de Wald se utilizará para ordenar los genes.
+
+res_raw_df <- as.data.frame(res_raw) %>%
+  rownames_to_column("ENTREZID")
+
+# ----------------------------------------------------------
+# 12.4. Aplicar shrinkage al log2 Fold Change
+# ----------------------------------------------------------
+
+# Confirmar previamente con resultsNames(dds) que este
+# coeficiente existe exactamente con este nombre.
+
+res <- lfcShrink(
+  dds,
+  coef = "response_group_Responder_vs_NonResponder",
+  type = "apeglm"
+)
+
+
+# ----------------------------------------------------------
+# 12.5. Convertir resultados en tabla
+# ----------------------------------------------------------
+
+res_df <- as.data.frame(res) %>%
+  rownames_to_column("ENTREZID") %>%
+  arrange(padj)
+
+head(res_df)
+
+
+# ----------------------------------------------------------
+# 12.6. Añadir símbolos y nombres de genes
+# ----------------------------------------------------------
+
+res_df$SYMBOL <- mapIds(
+  org.Hs.eg.db,
+  keys = as.character(res_df$ENTREZID),
+  column = "SYMBOL",
+  keytype = "ENTREZID",
+  multiVals = "first"
+)
+
+res_df$GENENAME <- mapIds(
+  org.Hs.eg.db,
+  keys = as.character(res_df$ENTREZID),
+  column = "GENENAME",
+  keytype = "ENTREZID",
+  multiVals = "first"
+)
+
+
+# ----------------------------------------------------------
+# 12.7. Definir genes diferencialmente expresados
+# ----------------------------------------------------------
+
+deg <- res_df %>%
+  filter(
+    !is.na(padj),
+    padj < 0.05,
+    abs(log2FoldChange) >= 1
+  )
+
+
+# ----------------------------------------------------------
+# 12.8. Resumen de DEGs
+# ----------------------------------------------------------
+
+cat(
+  "\nNúmero total de DEGs:",
+  nrow(deg),
+  "\n"
+)
+
+cat(
+  "Sobreexpresados en Respondedores:",
+  sum(deg$log2FoldChange > 0),
+  "\n"
+)
+
+cat(
+  "Sobreexpresados en NonRespondedores:",
+  sum(deg$log2FoldChange < 0),
+  "\n"
+)
+
+head(deg)
+
+
+############################################################
+# 13. VOLCANO PLOT
+#
+# Permite visualizar simultáneamente:
+#
+# eje X = log2FoldChange
+# eje Y = significación estadística
+############################################################
+
+
+# ----------------------------------------------------------
+# 13.1. Clasificar genes para interpretación
+# ----------------------------------------------------------
+
+res_df <- res_df %>%
+  mutate(
+    DEG_status = case_when(
+      
+      !is.na(padj) &
+        padj < 0.05 &
+        log2FoldChange >= 1
+      ~ "Up_Responder",
+      
+      !is.na(padj) &
+        padj < 0.05 &
+        log2FoldChange <= -1
+      ~ "Up_NonResponder",
+      
+      TRUE ~ "Not_significant"
+    )
+  )
+
+
+# ----------------------------------------------------------
+# 13.2. Crear etiquetas de genes
+# ----------------------------------------------------------
+
+res_df$gene_label <- ifelse(
+  is.na(res_df$SYMBOL),
+  res_df$ENTREZID,
+  res_df$SYMBOL
+)
+
+
+# ----------------------------------------------------------
+# 13.3. Volcano plot
+# ----------------------------------------------------------
+
+EnhancedVolcano(
+  res_df,
+  lab = res_df$gene_label,
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = 0.05,
+  FCcutoff = 1,
+  title = "Expresión diferencial pretratamiento",
+  subtitle = "Responder vs NonResponder - GSE91061",
+  caption = "padj < 0.05; |log2FC| >= 1"
+)
+
+
+############################################################
+# 14. HEATMAP DE GENES DIFERENCIALMENTE EXPRESADOS
+############################################################
+
+# ----------------------------------------------------------
+# 14.1. Comprobar que existan DEGs
+# ----------------------------------------------------------
+
+if (nrow(deg) > 0) {
+  
+  
+# --------------------------------------------------------
+# 14.2. Definir número de genes a visualizar
+# --------------------------------------------------------
+  
+  n_heatmap <- min(
+    30,
+    nrow(deg)
+  )
+  
+  
+# --------------------------------------------------------
+# 14.3. Seleccionar genes más significativos
+# --------------------------------------------------------
+  
+ top_genes <- deg %>%
+    arrange(padj) %>%
+    slice_head(
+      n = n_heatmap
+    ) %>%
+    pull(ENTREZID)
+  
+  
+# --------------------------------------------------------
+# 14.4. Extraer datos VST
+# --------------------------------------------------------
+  
+  heatmap_mat <- vst_mat[
+    top_genes,
+    ,
+    drop = FALSE
+  ]
+  
+  
+# --------------------------------------------------------
+# 14.5. Estandarizar expresión por gen
+#
+# El Z-score permite comparar expresión relativa entre
+# muestras para cada gen.
+# --------------------------------------------------------
+  
+  heatmap_scaled <- t(
+    scale(
+      t(heatmap_mat)
+    )
+  )
+  
+  
+# --------------------------------------------------------
+# 14.6. Sustituir Entrez IDs por símbolos génicos
+# --------------------------------------------------------
+  
+  symbol_lookup <- res_df$SYMBOL[
+    match(
+      rownames(heatmap_scaled),
+      res_df$ENTREZID
+    )
+  ]
+  
+  
+  rownames(heatmap_scaled) <- ifelse(
+    is.na(symbol_lookup),
+    rownames(heatmap_scaled),
+    symbol_lookup
+  )
+  
+  
+# --------------------------------------------------------
+# 14.7. Crear anotación clínica
+# --------------------------------------------------------
+  
+  annotation_col <- data.frame(
+    response_group =
+      meta_final$response_group
+  )
+  
+  rownames(annotation_col) <-
+    rownames(meta_final)
+  
+  
+# --------------------------------------------------------
+# 14.8. Crear heatmap
+# --------------------------------------------------------
+  
+  pheatmap(
+    heatmap_scaled,
+    annotation_col = annotation_col,
+    show_colnames = FALSE,
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    main = paste0(
+      "Top ",
+      n_heatmap,
+      " DEGs - GSE91061"
+    )
+  )
+  
+  
+} else {
+  
+  warning(
+    "No se identificaron DEGs con los criterios establecidos. ",
+    "No se generará heatmap."
+  )
+  
+}
+
+
+############################################################
+# 15. ANÁLISIS FUNCIONAL DE LOS GENES DIFERENCIALMENTE
+#     EXPRESADOS
+#
+# Objetivo:
+# Evaluar la relevancia biológica de los DEGs identificados
+# en GSE91061 mediante análisis de sobrerrepresentación.
+#
+# Se analizarán:
+#
+# 1. Todos los DEGs conjuntamente
+# 2. DEGs sobreexpresados en Respondedores
+# 3. DEGs sobreexpresados en NonRespondedores
+#
+# Bases utilizadas:
+#
+# - Gene Ontology Biological Process (GO-BP)
+# - KEGG
+#
+# El universo de referencia estará constituido por todos los
+# genes que superaron el filtrado de baja expresión y fueron,
+# por tanto, elegibles para el análisis diferencial.
+############################################################
+
+# ----------------------------------------------------------
+# 15.1. DEFINIR UNIVERSO DE GENES
+# ----------------------------------------------------------
+
+gene_universe <- unique(
+  as.character(
+    rownames(counts_filt)
+  )
+)
+
+
+# Eliminar posibles identificadores vacíos
+gene_universe <- gene_universe[
+  !is.na(gene_universe) &
+    gene_universe != ""
+]
+
+
+cat(
+  "\nNúmero de genes utilizados como universo:",
+  length(gene_universe),
+  "\n"
+)
+
+
+############################################################
+# 15.2. PREPARAR LOS TRES CONJUNTOS DE GENES
+############################################################
+
+# ----------------------------------------------------------
+# 15.2.1. Todos los DEGs
+# ----------------------------------------------------------
+
+genes_all <- deg %>%
+  filter(
+    !is.na(ENTREZID)
+  ) %>%
+  pull(ENTREZID) %>%
+  as.character() %>%
+  unique()
+
+
+# ----------------------------------------------------------
+# 15.2.2. Genes sobreexpresados en Respondedores
+#
+# log2FoldChange > 0:
+# mayor expresión en Respondedores.
+# ----------------------------------------------------------
+
+genes_responder <- deg %>%
+  filter(
+    !is.na(ENTREZID),
+    log2FoldChange > 0
+  ) %>%
+  pull(ENTREZID) %>%
+  as.character() %>%
+  unique()
+
+
+# ----------------------------------------------------------
+# 15.2.3. Genes sobreexpresados en NonRespondedores
+#
+# log2FoldChange < 0:
+# mayor expresión en NonRespondedores.
+# ----------------------------------------------------------
+
+genes_nonresponder <- deg %>%
+  filter(
+    !is.na(ENTREZID),
+    log2FoldChange < 0
+  ) %>%
+  pull(ENTREZID) %>%
+  as.character() %>%
+  unique()
+
+
+cat(
+  "\nDEGs totales para enriquecimiento:",
+  length(genes_all),
+  "\n"
+)
+
+cat(
+  "DEGs sobreexpresados en Respondedores:",
+  length(genes_responder),
+  "\n"
+)
+
+cat(
+  "DEGs sobreexpresados en NonRespondedores:",
+  length(genes_nonresponder),
+  "\n"
+)
+
+
+############################################################
+# 15.3. FUNCIÓN PARA ENRIQUECIMIENTO GO-BP
+############################################################
+
+run_GO <- function(gene_list, analysis_name) {
+  
+  # Si no existen genes suficientes, no ejecutar.
+  if (length(gene_list) < 2) {
+    
+    warning(
+      paste(
+        "No existen suficientes genes para GO:",
+        analysis_name
+      )
+    )
+    
+    return(NULL)
+  }
+  
+  result <- enrichGO(
+    
+    gene = gene_list,
+    
+    universe = gene_universe,
+    
+    OrgDb = org.Hs.eg.db,
+    
+    keyType = "ENTREZID",
+    
+    ont = "BP",
+    
+    pAdjustMethod = "BH",
+    
+    pvalueCutoff = 0.05,
+    
+    qvalueCutoff = 0.05,
+    
+    readable = TRUE
+  )
+  
+  
+  cat(
+    "\n==============================\n",
+    "GO-BP:",
+    analysis_name,
+    "\n==============================\n"
+  )
+  
+  
+  result_df <- as.data.frame(result)
+  
+  
+  if (nrow(result_df) > 0) {
+    
+    print(
+      head(
+        result_df,
+        15
+      )
+    )
+    
+    print(
+      dotplot(
+        result,
+        showCategory = 15
+      ) +
+        ggtitle(
+          paste(
+            "GO Biological Process -",
+            analysis_name
+          )
+        )
+    )
+    
+  } else {
+    
+    cat(
+      "\nNo se encontraron términos GO-BP significativos.\n"
+    )
+  }
+  
+  
+  return(result)
+}
+
+
+############################################################
+# 15.4. FUNCIÓN PARA ENRIQUECIMIENTO KEGG
+############################################################
+
+run_KEGG <- function(gene_list, analysis_name) {
+  
+  if (length(gene_list) < 2) {
+    
+    warning(
+      paste(
+        "No existen suficientes genes para KEGG:",
+        analysis_name
+      )
+    )
+    
+    return(NULL)
+  }
+  
+  result <- enrichKEGG(
+    
+    gene = gene_list,
+    
+    universe = gene_universe,
+    
+    organism = "hsa",
+    
+    keyType = "ncbi-geneid",
+    
+    pAdjustMethod = "BH",
+    
+    pvalueCutoff = 0.05,
+    
+    qvalueCutoff = 0.05
+  )
+  
+  
+  cat(
+    "\n==============================\n",
+    "KEGG:",
+    analysis_name,
+    "\n==============================\n"
+  )
+  
+  result_df <- as.data.frame(result)
+  
+  if (nrow(result_df) > 0) {
+    
+    print(
+      head(
+        result_df,
+        15
+      )
+    )
+    
+    print(
+      dotplot(
+        result,
+        showCategory = 15
+      ) +
+        ggtitle(
+          paste(
+            "KEGG -",
+            analysis_name
+          )
+        )
+    )
+    
+  } else {
+    
+    cat(
+      "\nNo se encontraron vías KEGG significativas.\n"
+    )
+  }
+  
+  
+  return(result)
+}
+
+
+############################################################
+# 15.5. ANÁLISIS FUNCIONAL GLOBAL
+#
+# Responde a:
+#
+# ¿Qué procesos y vías caracterizan globalmente los DEGs
+# asociados a respuesta anti-PD-1?
+############################################################
+
+ego_all <- run_GO(
+  genes_all,
+  "Todos los DEGs"
+)
+
+
+ekegg_all <- run_KEGG(
+  genes_all,
+  "Todos los DEGs"
+)
+
+
+############################################################
+# 15.6. ANÁLISIS FUNCIONAL DE GENES SOBREEXPRESADOS
+#       EN RESPONDEDORES
+############################################################
+
+ego_responder <- run_GO(
+  genes_responder,
+  "Sobreexpresados en Respondedores"
+)
+
+
+ekegg_responder <- run_KEGG(
+  genes_responder,
+  "Sobreexpresados en Respondedores"
+)
+
+
+############################################################
+# 15.7. ANÁLISIS FUNCIONAL DE GENES SOBREEXPRESADOS
+#       EN NONRESPONDEDORES
+############################################################
+
+ego_nonresponder <- run_GO(
+  genes_nonresponder,
+  "Sobreexpresados en NonRespondedores"
+)
+
+
+ekegg_nonresponder <- run_KEGG(
+  genes_nonresponder,
+  "Sobreexpresados en NonRespondedores"
+)
+
+cat("\nNúmero total de DEGs para enriquecimiento:\n")
+length(genes_all)
+
+cat("\nGenes sobreexpresados en Respondedores:\n")
+length(genes_responder)
+
+cat("\nGenes sobreexpresados en NonRespondedores:\n")
+length(genes_nonresponder)
+
+cat("\nTamaño del universo de genes:\n")
+length(gene_universe)
+
+cat("\nDEGs totales originales:\n")
+nrow(deg)
+
+cat("\nDEGs con ENTREZID válido:\n")
+sum(!is.na(deg$ENTREZID))
+
+cat("\nENTREZID únicos:\n")
+length(unique(na.omit(deg$ENTREZID)))
+
+############################################################
+# 15.8. EXPORTAR RESULTADOS PRINCIPALES
+############################################################
+
+write.csv(
+  res_df,
+  "GSE91061_DESeq2_resultados_completos.csv",
+  row.names = FALSE
+)
+
+
+write.csv(
+  deg,
+  "GSE91061_DEGs_significativos.csv",
+  row.names = FALSE
+)
+
+
+write.csv(
+  pca_data,
+  "GSE91061_PCA_muestras.csv",
+  row.names = FALSE
+)
+
+
+############################################################
+# 15.9. EXPORTAR GO
+############################################################
+
+if (
+  !is.null(ego_all) &&
+  nrow(as.data.frame(ego_all)) > 0
+) {
+  
+  write.csv(
+    as.data.frame(ego_all),
+    "GO_BP_todos_DEGs.csv",
+    row.names = FALSE
+  )
+}
+
+if (
+  !is.null(ego_responder) &&
+  nrow(as.data.frame(ego_responder)) > 0
+) {
+  
+  write.csv(
+    as.data.frame(ego_responder),
+    "GO_BP_Respondedores.csv",
+    row.names = FALSE
+  )
+}
+
+if (
+  !is.null(ego_nonresponder) &&
+  nrow(as.data.frame(ego_nonresponder)) > 0
+) {
+  
+  write.csv(
+    as.data.frame(ego_nonresponder),
+    "GO_BP_NonRespondedores.csv",
+    row.names = FALSE
+  )
+}
+
+
+############################################################
+# 15.10. EXPORTAR KEGG
+############################################################
+
+if (
+  !is.null(ekegg_all) &&
+  nrow(as.data.frame(ekegg_all)) > 0
+) {
+  
+  write.csv(
+    as.data.frame(ekegg_all),
+    "KEGG_todos_DEGs.csv",
+    row.names = FALSE
+  )
+}
+
+
+if (
+  !is.null(ekegg_responder) &&
+  nrow(as.data.frame(ekegg_responder)) > 0
+) {
+  
+  write.csv(
+    as.data.frame(ekegg_responder),
+    "KEGG_Respondedores.csv",
+    row.names = FALSE
+  )
+}
+
+
+if (
+  !is.null(ekegg_nonresponder) &&
+  nrow(as.data.frame(ekegg_nonresponder)) > 0
+) {
+  
+  write.csv(
+    as.data.frame(ekegg_nonresponder),
+    "KEGG_NonRespondedores.csv",
+    row.names = FALSE
+  )
+}
+
+############################################################
+# 15.11. GSEA SOBRE EL TRANSCRIPTOMA COMPLETO
+#
+# El análisis de sobrerrepresentación (ORA) utiliza únicamente
+# los genes que superan los umbrales definidos para DEGs.
+#
+# Como complemento, GSEA evalúa si conjuntos funcionales
+# presentan una señal coordinada a lo largo de todo el
+# transcriptoma, incluso cuando genes individuales no alcanzan
+# los criterios de significación utilizados para definir DEGs.
+#
+# Para construir el ranking se utiliza el estadístico de Wald
+# de DESeq2 correspondiente al contraste:
+#
+# Responder vs NonResponder.
+#
+# Un valor positivo indica asociación con Respondedores.
+# Un valor negativo indica asociación con NonRespondedores.
+############################################################
+
+
+# ----------------------------------------------------------
+# 15.11.1. Construir ranking génico
+# ----------------------------------------------------------
+
+gsea_rank <- res_raw_df %>%
+  filter(
+    !is.na(stat),
+    !is.na(ENTREZID),
+    ENTREZID != ""
+  ) %>%
+  distinct(
+    ENTREZID,
+    .keep_all = TRUE
+  ) %>%
+  arrange(
+    desc(stat)
+  )
+
+
+ranked_entrez <- gsea_rank$stat
+
+names(ranked_entrez) <-
+  gsea_rank$ENTREZID
+
+ranked_entrez <- sort(
+  ranked_entrez,
+  decreasing = TRUE
+)
+
+
+stopifnot(
+  all(
+    is.finite(ranked_entrez)
+  )
+)
+
+
+cat(
+  "\nNúmero de genes incluidos en el ranking GSEA:",
+  length(ranked_entrez),
+  "\n"
+)
+
+############################################################
+# 15.11.2. GSEA - Gene Ontology Biological Process
+############################################################
+
+gsea_go <- gseGO(
+  geneList = ranked_entrez,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",
+  minGSSize = 15,
+  maxGSSize = 500,
+  pvalueCutoff = 1,
+  pAdjustMethod = "BH",
+  eps = 0,
+  verbose = FALSE,
+  seed = TRUE
+)
+
+
+gsea_go_df <- as.data.frame(
+  gsea_go
+)
+
+# ----------------------------------------------------------
+# 15.11.2.1. Seleccionar términos significativos
+#
+# Se consideran significativos aquellos con:
+# p.adjust < 0.05
+#
+# El filtrado se realiza DESPUÉS de ejecutar GSEA para
+# conservar y documentar la tabla completa de resultados.
+# ----------------------------------------------------------
+
+gsea_go_significant <- gsea_go_df %>%
+  filter(
+    !is.na(p.adjust),
+    p.adjust < 0.05
+  )
+
+
+cat(
+  "\nNúmero de términos GO-BP significativos en GSEA:",
+  nrow(gsea_go_significant),
+  "\n"
+)
+
+
+# Mostrar resultados significativos
+if (nrow(gsea_go_significant) > 0) {
+  
+  print(
+    gsea_go_significant %>%
+      arrange(p.adjust) %>%
+      head(20)
+  )
+  
+} else {
+  
+  cat(
+    "\nNo se identificaron términos GO-BP significativos ",
+    "con p.adjust < 0.05.\n"
+  )
+}
+
+
+# Guardar TODOS los resultados
+write.csv(
+  gsea_go_df,
+  "GSEA_GO_BP_GSE91061.csv",
+  row.names = FALSE
+)
+
+
+# Guardar únicamente los significativos
+write.csv(
+  gsea_go_significant,
+  "GSEA_GO_BP_significativos_GSE91061.csv",
+  row.names = FALSE
+)
+
+# ============================================================
+# FIGURA GSEA GO-BP – PROCESOS REPRESENTATIVOS
+# ============================================================
+
+go_selected <- gsea_go_significant %>%
+  filter(
+    Description %in% c(
+      "adaptive immune response",
+      "lymphocyte differentiation",
+      "antigen receptor-mediated signaling pathway",
+      "regulation of T cell activation",
+      "B cell activation",
+      "positive regulation of lymphocyte activation",
+      "leukocyte cell-cell adhesion",
+      "T cell differentiation involved in immune response",
+      "positive regulation of T cell activation",
+      "alpha-beta T cell activation"
+    )
+  ) %>%
+  arrange(NES)
+
+# Comprobar términos seleccionados
+go_selected %>%
+  select(
+    ID,
+    Description,
+    setSize,
+    NES,
+    pvalue,
+    p.adjust
+  )
+
+# Gráfico
+ggplot(
+  go_selected,
+  aes(
+    x = NES,
+    y = reorder(Description, NES)
+  )
+) +
+  geom_point(
+    aes(
+      size = setSize,
+      color = -log10(p.adjust)
+    )
+  ) +
+  labs(
+    title = "Procesos biológicos enriquecidos asociados con la respuesta",
+    subtitle = "GSEA GO-BP – GSE91061",
+    x = "NES",
+    y = NULL,
+    size = "Tamaño del conjunto",
+    color = expression(-log[10](p[ajustado]))
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = 9)
+  )
+
+ggsave(
+  "GSE91061_GSEA_GO_BP.png",
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+
+
+############################################################
+# 15.11.3. GSEA - KEGG
+############################################################
+
+gsea_kegg <- gseKEGG(
+  geneList = ranked_entrez,
+  organism = "hsa",
+  minGSSize = 15,
+  maxGSSize = 500,
+  pvalueCutoff = 1,
+  pAdjustMethod = "BH",
+  eps = 0,
+  verbose = FALSE,
+  seed = TRUE
+)
+
+
+gsea_kegg_df <- as.data.frame(
+  gsea_kegg
+)
+
+
+# ----------------------------------------------------------
+# 15.11.3.1. Seleccionar vías significativas
+#
+# Se consideran significativas aquellas con:
+# p.adjust < 0.05
+#
+# El filtrado se realiza DESPUÉS de ejecutar GSEA para
+# conservar y documentar la tabla completa de resultados.
+# ----------------------------------------------------------
+
+gsea_kegg_significant <- gsea_kegg_df %>%
+  filter(
+    !is.na(p.adjust),
+    p.adjust < 0.05
+  )
+
+
+cat(
+  "\nNúmero de vías KEGG significativas en GSEA:",
+  nrow(gsea_kegg_significant),
+  "\n"
+)
+
+
+# Mostrar resultados significativos
+if (nrow(gsea_kegg_significant) > 0) {
+  
+  print(
+    gsea_kegg_significant %>%
+      arrange(p.adjust) %>%
+      head(20)
+  )
+  
+} else {
+  
+  cat(
+    "\nNo se identificaron vías KEGG significativas ",
+    "con p.adjust < 0.05.\n"
+  )
+}
+
+
+# Guardar TODOS los resultados
+write.csv(
+  gsea_kegg_df,
+  "GSEA_KEGG_GSE91061.csv",
+  row.names = FALSE
+)
+
+
+# Guardar únicamente los resultados significativos
+write.csv(
+  gsea_kegg_significant,
+  "GSEA_KEGG_significativos_GSE91061.csv",
+  row.names = FALSE
+)
+
+# ============================================================
+# FIGURA GSEA KEGG – VÍAS REPRESENTATIVAS
+# ============================================================
+
+kegg_selected <- gsea_kegg_significant %>%
+  filter(
+    Description %in% c(
+      "Cytokine-cytokine receptor interaction",
+      "Th1 and Th2 cell differentiation",
+      "Th17 cell differentiation",
+      "Natural killer cell mediated cytotoxicity",
+      "NF-kappa B signaling pathway",
+      "B cell receptor signaling pathway",
+      "Chemokine signaling pathway",
+      "T cell receptor signaling pathway",
+      "JAK-STAT signaling pathway",
+      "PD-L1 expression and PD-1 checkpoint pathway in cancer",
+      "Oxidative phosphorylation",
+      "Ribosome"
+    )
+  ) %>%
+  arrange(NES)
+
+# Comprobar vías seleccionadas
+kegg_selected %>%
+  select(
+    ID,
+    Description,
+    setSize,
+    NES,
+    pvalue,
+    p.adjust
+  )
+
+# Gráfico
+ggplot(
+  kegg_selected,
+  aes(
+    x = NES,
+    y = reorder(Description, NES)
+  )
+) +
+  geom_point(
+    aes(
+      size = setSize,
+      color = -log10(p.adjust)
+    )
+  ) +
+  labs(
+    title = "Vías KEGG enriquecidas asociadas con la respuesta",
+    subtitle = "GSEA – GSE91061",
+    x = "NES",
+    y = NULL,
+    size = "Tamaño del conjunto",
+    color = expression(-log[10](p[ajustado]))
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = 9)
+  )
+
+ggsave(
+  "GSE91061_GSEA_KEGG.png",
+  width = 11,
+  height = 7,
+  dpi = 300
+)
+
+
+############################################################
+# 16. DESCARGA Y CARACTERIZACIÓN DEL DATASET DE EVALUACIÓN
+#     DE REPRODUCIBILIDAD Y PRIORIZACIÓN GSE78220
+#
+# GSE78220 contiene biopsias de melanoma obtenidas antes
+# del tratamiento anti-PD-1.
+#
+# El archivo procesado disponible en GEO contiene valores FPKM.
+#
+# IMPORTANTE:
+# Los FPKM NO se analizarán con DESeq2.
+# Se utilizarán para evaluar la reproducibilidad de la
+# dirección de efecto de los genes candidatos identificados
+# previamente en GSE91061 y para su priorización exploratoria.
+############################################################
+
+# ----------------------------------------------------------
+# 16.1. Descargar metadatos GEO
+# ----------------------------------------------------------
+
+gse_eval <- getGEO(
+  "GSE78220",
+  GSEMatrix = TRUE, getGPL = FALSE
+)
+
+eset_eval <- gse_eval[[1]]
+
+meta_eval_raw <- pData(eset_eval)  
+
+
+# Revisar estructura
+cat("\nDimensiones de los metadatos GSE78220:\n")
+print(dim(meta_eval_raw))
+
+cat("\nColumnas disponibles:\n")
+print(colnames(meta_eval_raw))
+
+
+# ----------------------------------------------------------
+# 16.2. Descargar archivos suplementarios
+# ----------------------------------------------------------
+
+getGEOSuppFiles(
+  "GSE78220",
+  makeDirectory = TRUE
+)
+
+cat("\nArchivos descargados de GSE78220:\n")
+
+print(
+  list.files(
+    "GSE78220",
+    recursive = TRUE
+  )
+)
+
+
+############################################################
+# 17. CONSTRUCCIÓN DE METADATOS CLÍNICOS DE LA COHORTE DE
+#     PRIORIZACIÓN
+#
+# Se identificarán automáticamente las columnas correspondientes
+# a:
+#
+# - paciente
+# - respuesta anti-PD-1
+# - tiempo de biopsia
+# - tratamiento
+#
+# Esto evita depender de posiciones de columna fijas.
+############################################################
+
+# ----------------------------------------------------------
+# 17.1. Buscar columnas relevantes
+# ----------------------------------------------------------
+
+patient_col_eval <- grep(
+  "patient.*id",
+  colnames(meta_eval_raw),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+response_col_eval <- grep(
+  "anti.*pd.*1.*response|response.*pd",
+  colnames(meta_eval_raw),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+biopsy_col_eval <- grep(
+  "biopsy.*time",
+  colnames(meta_eval_raw),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+treatment_col_eval <- grep(
+  "^treatment",
+  colnames(meta_eval_raw),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+
+cat("\nColumna de paciente encontrada:\n")
+print(patient_col_eval)
+
+cat("\nColumna de respuesta encontrada:\n")
+print(response_col_eval)
+
+cat("\nColumna de biopsia encontrada:\n")
+print(biopsy_col_eval)
+
+cat("\nColumna de tratamiento encontrada:\n")
+print(treatment_col_eval)
+
+
+# Debe encontrarse exactamente una columna de paciente
+# y una columna de respuesta.
+
+stopifnot(length(patient_col_eval) == 1)
+stopifnot(length(response_col_eval) == 1)
+
+
+# ----------------------------------------------------------
+# 17.2. Construir metadata limpio
+# ----------------------------------------------------------
+
+meta_eval <- meta_eval_raw %>%
+  as.data.frame() %>%
+  mutate(
+    
+    sample_id = title,
+    
+    geo_accession_val = geo_accession,
+    
+    patient_id = as.character(
+      .data[[patient_col_eval]]
+    ),
+    
+    response_text = as.character(
+      .data[[response_col_eval]]
+    )
+  )
+
+
+# Si existe información de biopsia
+if (length(biopsy_col_eval) == 1) {
+  
+  meta_eval$biopsy_time <-
+    as.character(
+      meta_eval[[biopsy_col_eval]]
+    )
+}
+
+
+# Si existe información de tratamiento
+if (length(treatment_col_eval) == 1) {
+  
+  meta_eval$treatment <-
+    as.character(
+      meta_eval[[treatment_col_eval]]
+    )
+}
+
+
+# ----------------------------------------------------------
+# 17.3. Revisar respuestas originales
+# ----------------------------------------------------------
+
+cat("\nRespuestas originales GSE78220:\n")
+
+print(
+  table(
+    meta_eval$response_text,
+    useNA = "ifany"
+  )
+)
+
+
+############################################################
+# 17.4. CONSTRUIR VARIABLE RESPONDER / NONRESPONDER
+#
+# GSE78220 presenta categorías clínicas como:
+#
+# Complete Response
+# Partial Response
+# Progressive Disease
+#
+# Para mantener la misma definición que en GSE91061:
+#
+# CR / PR -> Responder
+# PD      -> NonResponder
+#
+# Si apareciera Stable Disease, se excluirá del análisis
+# binario principal, igual que en GSE91061.
+############################################################
+
+meta_eval <- meta_eval %>%
+  mutate(
+    
+    response_code = case_when(
+      
+      str_detect(
+        response_text,
+        regex(
+          "complete response|\\bCR\\b",
+          ignore_case = TRUE
+        )
+      ) ~ "CR",
+      
+      str_detect(
+        response_text,
+        regex(
+          "partial response|\\bPR\\b",
+          ignore_case = TRUE
+        )
+      ) ~ "PR",
+      
+      str_detect(
+        response_text,
+        regex(
+          "stable disease|\\bSD\\b",
+          ignore_case = TRUE
+        )
+      ) ~ "SD",
+      
+      str_detect(
+        response_text,
+        regex(
+          "progressive disease|\\bPD\\b",
+          ignore_case = TRUE
+        )
+      ) ~ "PD",
+      
+      TRUE ~ NA_character_
+    ),
+    
+    
+    response_group = case_when(
+      
+      response_code %in% c(
+        "CR",
+        "PR"
+      ) ~ "Responder",
+      
+      response_code == "PD" ~ "NonResponder",
+      
+      response_code == "SD" ~ NA_character_,
+      
+      TRUE ~ NA_character_
+    )
+  )
+
+
+# ----------------------------------------------------------
+# 17.5. Comprobar clasificación
+# ----------------------------------------------------------
+
+cat(
+  "\nCorrespondencia respuesta original - grupo analítico GSE78220:\n"
+)
+
+print(
+  table(
+    meta_eval$response_code,
+    meta_eval$response_group,
+    useNA = "ifany"
+  )
+)
+
+
+############################################################
+# 17.6. COMPROBAR QUE TODAS LAS MUESTRAS SON PRETRATAMIENTO
+############################################################
+
+if ("biopsy_time" %in% colnames(meta_eval)) {
+  
+  cat("\nMomentos de biopsia en GSE78220:\n")
+  
+  print(
+    table(
+      meta_eval$biopsy_time,
+      useNA = "ifany"
+    )
+  )
+  
+}
+
+
+############################################################
+# 17.7. Seleccionar cohorte de priorización
+############################################################
+
+meta_eval_final <- meta_eval %>%
+  filter(
+    !is.na(response_group)
+  )
+
+
+meta_eval_final$response_group <- factor(
+  meta_eval_final$response_group,
+  levels = c(
+    "NonResponder",
+    "Responder"
+  )
+)
+
+
+cat("\nDistribución de muestras GSE78220:\n")
+
+print(
+  table(
+    meta_eval_final$response_group
+  )
+)
+
+
+cat("\nNúmero de pacientes únicos GSE78220:\n")
+
+print(
+  n_distinct(
+    meta_eval_final$patient_id
+  )
+)
+
+
+############################################################
+# 18. LECTURA DE LA MATRIZ FPKM DE GSE78220
+############################################################
+
+# ----------------------------------------------------------
+# 18.1. Localizar archivo Excel automáticamente
+# ----------------------------------------------------------
+
+xlsx_files <- list.files(
+  "GSE78220",
+  pattern = "\\.xlsx$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+
+cat("\nArchivo(s) Excel encontrados:\n")
+print(xlsx_files)
+
+
+stopifnot(length(xlsx_files) >= 1)
+
+
+fpkm_file <- xlsx_files[1]
+
+
+# ----------------------------------------------------------
+# 18.2. Revisar hojas del archivo
+# ----------------------------------------------------------
+
+cat("\nHojas disponibles en archivo FPKM:\n")
+
+print(
+  excel_sheets(
+    fpkm_file
+  )
+)
+
+
+# ----------------------------------------------------------
+# 18.3. Leer primera hoja
+# ----------------------------------------------------------
+
+fpkm_raw <- read_excel(
+  fpkm_file,
+  sheet = 1
+)
+
+
+cat("\nDimensiones originales del archivo FPKM:\n")
+print(dim(fpkm_raw))
+
+cat("\nPrimeras columnas:\n")
+print(colnames(fpkm_raw)[1:min(10, ncol(fpkm_raw))])
+
+head(fpkm_raw)
+
+
+############################################################
+# 18.4. IDENTIFICAR COLUMNA DE GENES
+#
+# El código busca nombres habituales:
+#
+# gene
+# gene_symbol
+# symbol
+# gene_name
+#
+# Si no encuentra automáticamente una columna adecuada,
+# mostrará las primeras columnas para revisión manual.
+############################################################
+
+gene_col_candidates <- grep(
+  "gene.*symbol|symbol|gene.*name|^gene$",
+  colnames(fpkm_raw),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+
+cat("\nColumnas candidatas para identificador génico:\n")
+print(gene_col_candidates)
+
+
+if (length(gene_col_candidates) == 0) {
+  
+  stop(
+    "No se identificó automáticamente la columna de genes. ",
+    "Revisar colnames(fpkm_raw) y definir gene_col_eval manualmente."
+  )
+  
+}
+
+
+gene_col_eval <- gene_col_candidates[1]
+
+
+cat("\nColumna utilizada como identificador génico:\n")
+print(gene_col_eval)
+
+
+############################################################
+# 18.5. IDENTIFICAR Y ARMONIZAR COLUMNAS DE MUESTRAS
+#
+# En el archivo FPKM de GSE78220 los nombres aparecen como:
+#
+# Pt1.baseline
+# Pt2.baseline
+# Pt27A.baseline
+# Pt27B.baseline
+# Pt16.onTx
+#
+# Mientras que en los metadatos GEO aparecen como:
+#
+# Pt1
+# Pt2
+# Pt27A
+# Pt27B
+# Pt16
+#
+# Por ello se eliminará el sufijo ".baseline" para relacionar
+# correctamente la matriz de expresión con los metadatos.
+#
+# Las muestras ".onTx" se excluirán del análisis predictivo,
+# ya que corresponden a biopsias obtenidas durante tratamiento.
+############################################################
+
+# ----------------------------------------------------------
+# 18.5.1. Identificar únicamente columnas baseline
+# ----------------------------------------------------------
+
+baseline_cols_eval <- grep(
+  "\\.baseline$",
+  colnames(fpkm_raw),
+  value = TRUE
+)
+
+cat("\nNúmero de columnas baseline encontradas:\n")
+print(length(baseline_cols_eval))
+
+cat("\nColumnas baseline:\n")
+print(baseline_cols_eval)
+
+
+# ----------------------------------------------------------
+# 18.5.2. Identificar muestras durante tratamiento
+# ----------------------------------------------------------
+
+ontx_cols_eval <- grep(
+  "\\.onTx$",
+  colnames(fpkm_raw),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+cat("\nMuestras on-treatment encontradas:\n")
+print(ontx_cols_eval)
+
+
+# ----------------------------------------------------------
+# 18.5.3. Crear correspondencia entre nombres del Excel
+#         y nombres de los metadatos
+# ----------------------------------------------------------
+
+sample_map_eval <- data.frame(
+  excel_name = baseline_cols_eval,
+  
+  sample_id = str_remove(
+    baseline_cols_eval,
+    "\\.baseline$"
+  ),
+  
+  stringsAsFactors = FALSE
+)
+
+
+cat("\nCorrespondencia entre columnas del Excel y sample_id:\n")
+print(sample_map_eval)
+
+
+# ----------------------------------------------------------
+# 18.5.4. Comprobar qué muestras baseline existen
+#         también en los metadatos clínicos
+# ----------------------------------------------------------
+
+sample_map_eval <- sample_map_eval %>%
+  mutate(
+    present_in_metadata =
+      sample_id %in% meta_eval_final$sample_id
+  )
+
+
+cat("\nCorrespondencia de muestras baseline con metadatos:\n")
+
+print(
+  table(
+    sample_map_eval$present_in_metadata
+  )
+)
+
+
+# Mostrar posibles columnas sin correspondencia
+unmatched_excel <- sample_map_eval %>%
+  filter(!present_in_metadata)
+
+cat("\nColumnas baseline sin correspondencia en metadatos:\n")
+print(unmatched_excel)
+
+
+# ----------------------------------------------------------
+# 18.5.5. Comprobar si existen muestras de los metadatos
+#         que no estén presentes como baseline en el Excel
+# ----------------------------------------------------------
+
+unmatched_metadata <- setdiff(
+  meta_eval_final$sample_id,
+  sample_map_eval$sample_id
+)
+
+cat("\nMuestras de metadatos sin expresión baseline:\n")
+print(unmatched_metadata)
+
+
+# ----------------------------------------------------------
+# 18.5.6. Conservar únicamente coincidencias válidas
+# ----------------------------------------------------------
+
+sample_map_eval <- sample_map_eval %>%
+  filter(present_in_metadata)
+
+
+# Debe existir al menos una muestra válida
+stopifnot(nrow(sample_map_eval) > 0)
+
+
+cat(
+  "\nNúmero final de muestras baseline disponibles para priorización:",
+  nrow(sample_map_eval),
+  "\n"
+)
+
+############################################################
+# 18.6. CONSTRUIR MATRIZ FPKM CON MUESTRAS BASELINE
+############################################################
+
+fpkm_df <- fpkm_raw %>%
+  select(
+    all_of(gene_col_eval),
+    all_of(sample_map_eval$excel_name)
+  ) %>%
+  as.data.frame()
+
+
+# Renombrar primera columna como SYMBOL
+colnames(fpkm_df)[1] <- "SYMBOL"
+
+
+# ----------------------------------------------------------
+# Cambiar nombres de columnas:
+#
+# Pt1.baseline -> Pt1
+# Pt2.baseline -> Pt2
+# Pt27A.baseline -> Pt27A
+# ----------------------------------------------------------
+
+colnames(fpkm_df)[-1] <- sample_map_eval$sample_id
+
+
+# Comprobar los nombres finales
+cat("\nNombres finales de las columnas de expresión:\n")
+print(colnames(fpkm_df)[1:min(15, ncol(fpkm_df))])
+
+
+# Eliminar genes sin símbolo válido
+fpkm_df <- fpkm_df %>%
+  filter(
+    !is.na(SYMBOL),
+    SYMBOL != ""
+  )
+
+
+# Combinar genes duplicados mediante expresión media
+fpkm_df <- fpkm_df %>%
+  group_by(SYMBOL) %>%
+  summarise(
+    across(
+      everything(),
+      ~ mean(as.numeric(.x), na.rm = TRUE)
+    ),
+    .groups = "drop"
+  )
+
+
+# Crear matriz numérica
+fpkm_mat <- fpkm_df %>%
+  column_to_rownames("SYMBOL") %>%
+  as.matrix()
+
+
+storage.mode(fpkm_mat) <- "numeric"
+
+
+# Comprobaciones
+stopifnot(!any(fpkm_mat < 0, na.rm = TRUE))
+
+cat("\nDimensiones de la matriz FPKM final:\n")
+print(dim(fpkm_mat))
+
+
+############################################################
+# 19. PREPROCESAMIENTO DEL DATASET DE PRIORIZACIÓN
+#
+# Los valores FPKM se transforman mediante:
+#
+# log2(FPKM + 1)
+#
+# Esto permite reducir asimetría y comparar niveles de
+# expresión dentro de GSE78220.
+#
+# NO se utilizarán estos valores para DESeq2.
+############################################################
+
+############################################################
+# 19.1. ALINEAR METADATOS Y MATRIZ DE EXPRESIÓN
+############################################################
+
+# Conservar únicamente muestras presentes en la matriz
+meta_eval_expr <- meta_eval_final %>%
+  filter(
+    sample_id %in% colnames(fpkm_mat)
+  )
+
+
+# Reordenar metadata exactamente en el orden de la matriz
+meta_eval_expr <- meta_eval_expr[
+  match(
+    colnames(fpkm_mat),
+    meta_eval_expr$sample_id
+  ),
+  ,
+  drop = FALSE
+]
+
+
+# Comprobación crítica
+stopifnot(
+  all(
+    colnames(fpkm_mat) ==
+      meta_eval_expr$sample_id
+  )
+)
+
+
+cat(
+  "\nCORRECTO: matriz FPKM y metadatos de GSE78220 están alineados.\n"
+)
+
+
+cat("\nNúmero de muestras finales de priorización:\n")
+print(ncol(fpkm_mat))
+
+
+cat("\nDistribución por respuesta:\n")
+print(
+  table(
+    meta_eval_expr$response_group
+  )
+)
+
+############################################################
+# 19.2. TRANSFORMACIÓN LOG2(FPKM + 1)
+############################################################
+
+log_fpkm <- log2(
+  fpkm_mat + 1
+)
+
+# Comprobar que la transformación no generó valores no finitos
+stopifnot(all(is.finite(log_fpkm)))
+
+# Revisar distribución
+summary(
+  as.numeric(log_fpkm)
+)
+
+
+############################################################
+# 19.3. CONTROL DE CALIDAD BÁSICO DE GSE78220
+#
+# Se evalúan características generales de la matriz de
+# expresión del dataset independiente antes del PCA y de
+# la evaluación de reproducibilidad de los biomarcadores candidatos.
+#
+# Se revisan:
+# - número de genes
+# - número de muestras
+# - ausencia de valores NA/no finitos
+# - proporción de valores FPKM iguales a cero por muestra
+# - correspondencia con los grupos clínicos
+############################################################
+
+# ----------------------------------------------------------
+# 19.3.1. Dimensiones de la matriz
+# ----------------------------------------------------------
+
+cat("\nNúmero de genes GSE78220:\n")
+print(nrow(log_fpkm))
+
+cat("\nNúmero de muestras GSE78220:\n")
+print(ncol(log_fpkm))
+
+
+# ----------------------------------------------------------
+# 19.3.2. Comprobar integridad de los datos
+# ----------------------------------------------------------
+
+stopifnot(!anyNA(log_fpkm))
+stopifnot(all(is.finite(log_fpkm)))
+stopifnot(all(fpkm_mat >= 0))
+
+
+cat(
+  "\nCORRECTO: la matriz no contiene NA,",
+  "valores infinitos ni valores negativos.\n"
+)
+
+
+# ----------------------------------------------------------
+# 19.3.3. Comprobar nuevamente alineación
+# ----------------------------------------------------------
+
+stopifnot(
+  all(
+    colnames(log_fpkm) ==
+      meta_eval_expr$sample_id
+  )
+)
+
+cat(
+  "\nCORRECTO: expresión y metadatos permanecen alineados.\n"
+)
+
+
+# ----------------------------------------------------------
+# 19.3.4. Proporción de ceros por muestra
+#
+# Se calcula utilizando los FPKM originales,
+# antes de la transformación log2(FPKM + 1).
+# ----------------------------------------------------------
+
+zero_fraction_eval <- colMeans(
+  fpkm_mat[
+    ,
+    colnames(log_fpkm),
+    drop = FALSE
+  ] == 0
+)
+
+
+# ----------------------------------------------------------
+# 19.3.5. Crear tabla de QC por muestra
+# ----------------------------------------------------------
+
+qc_eval <- data.frame(
+  sample_id = colnames(log_fpkm),
+  zero_fraction = zero_fraction_eval,
+  response_group = meta_eval_expr$response_group
+)
+
+
+cat("\nResumen de la proporción de ceros por muestra:\n")
+
+print(
+  summary(
+    qc_eval$zero_fraction
+  )
+)
+
+
+# Mostrar muestras con mayor proporción de ceros
+cat("\nMuestras con mayor proporción de ceros:\n")
+
+print(
+  qc_eval %>%
+    arrange(desc(zero_fraction)) %>%
+    head(10)
+)
+
+
+# ----------------------------------------------------------
+# 19.3.6. Comprobar distribución de grupos clínicos
+# ----------------------------------------------------------
+
+cat("\nDistribución clínica de las muestras utilizadas:\n")
+
+print(
+  table(
+    qc_eval$response_group,
+    useNA = "ifany"
+  )
+)
+
+
+############################################################
+# 19.4. PCA DEL DATASET DE PRIORIZACIÓN GSE78220
+#
+# Objetivos:
+#
+# - evaluar la estructura global de las muestras
+# - identificar posibles muestras atípicas
+# - observar si existe agrupamiento relacionado con respuesta
+#
+# Se seleccionan los genes con mayor varianza después de
+# transformar los valores mediante log2(FPKM + 1).
+############################################################
+
+# ----------------------------------------------------------
+# 19.4.1. Calcular varianza de cada gen
+# ----------------------------------------------------------
+
+gene_variance_eval <- apply(
+  log_fpkm,
+  1,
+  var,
+  na.rm = TRUE
+)
+
+
+# ----------------------------------------------------------
+# 19.4.2. Eliminar genes sin variabilidad
+#
+# Los genes con varianza cero no aportan información al PCA.
+# ----------------------------------------------------------
+
+gene_variance_eval <- gene_variance_eval[
+  is.finite(gene_variance_eval) &
+    gene_variance_eval > 0
+]
+
+
+cat(
+  "\nGenes con varianza mayor que cero:",
+  length(gene_variance_eval),
+  "\n"
+)
+
+
+# ----------------------------------------------------------
+# 19.4.3. Seleccionar los 500 genes de mayor varianza
+#
+# Si existen menos de 500, se utilizan todos los disponibles.
+# ----------------------------------------------------------
+
+n_top_var <- min(
+  500,
+  length(gene_variance_eval)
+)
+
+
+top_var_eval <- names(
+  sort(
+    gene_variance_eval,
+    decreasing = TRUE
+  )
+)[
+  seq_len(n_top_var)
+]
+
+
+cat(
+  "\nNúmero de genes utilizados para el PCA:",
+  length(top_var_eval),
+  "\n"
+)
+
+
+# ----------------------------------------------------------
+# 19.4.4. Realizar PCA
+#
+# Las muestras deben estar en filas y los genes en columnas,
+# por ello se transpone la matriz.
+#
+# center = TRUE:
+# centra cada gen respecto a su media.
+#
+# scale. = FALSE:
+# no se estandariza cada gen a varianza 1 porque ya hemos
+# seleccionado los genes de mayor variabilidad.
+# ----------------------------------------------------------
+
+pca_eval <- prcomp(
+  t(
+    log_fpkm[
+      top_var_eval,
+      ,
+      drop = FALSE
+    ]
+  ),
+  center = TRUE,
+  scale. = FALSE
+)
+
+
+# ----------------------------------------------------------
+# 19.4.5. Calcular porcentaje de varianza explicado
+# ----------------------------------------------------------
+
+variance_eval <- summary(
+  pca_eval
+)$importance[2, 1:2] * 100
+
+
+cat("\nVarianza explicada por PC1 y PC2:\n")
+print(variance_eval)
+
+
+# ----------------------------------------------------------
+# 19.4.6. Construir tabla para visualizar PCA
+#
+# IMPORTANTE:
+# Se utiliza sample_id, no expression_id.
+# ----------------------------------------------------------
+
+pca_eval_df <- data.frame(
+  sample_id = rownames(pca_eval$x),
+  PC1 = pca_eval$x[, 1],
+  PC2 = pca_eval$x[, 2]
+) %>%
+  left_join(
+    meta_eval_expr %>%
+      select(
+        sample_id,
+        patient_id,
+        response_group
+      ),
+    by = "sample_id"
+  )
+
+
+# Comprobar que todas las muestras recibieron metadata clínica
+stopifnot(
+  !anyNA(
+    pca_eval_df$response_group
+  )
+)
+
+
+# ----------------------------------------------------------
+# 19.4.7. Visualizar PCA según respuesta clínica
+# ----------------------------------------------------------
+
+pca_eval_plot <- ggplot(
+  pca_eval_df,
+  aes(
+    x = PC1,
+    y = PC2,
+    color = response_group
+  )
+) +
+  geom_point(
+    size = 3,
+    alpha = 0.8
+  ) +
+  xlab(
+    paste0(
+      "PC1: ",
+      round(variance_eval[1], 1),
+      "% de varianza"
+    )
+  ) +
+  ylab(
+    paste0(
+      "PC2: ",
+      round(variance_eval[2], 1),
+      "% de varianza"
+    )
+  ) +
+  labs(
+    title = "PCA de la cohorte independiente GSE78220",
+    subtitle = "Muestras baseline tratadas con anti-PD-1",
+    color = "Respuesta"
+  ) +
+  theme_minimal()
+
+
+print(pca_eval_plot)
+
+
+# ----------------------------------------------------------
+# 19.4.8. PCA con identificadores de muestra
+#
+# Permite reconocer visualmente posibles muestras alejadas.
+# ----------------------------------------------------------
+
+pca_eval_labels <- ggplot(
+  pca_eval_df,
+  aes(
+    x = PC1,
+    y = PC2,
+    color = response_group,
+    label = sample_id
+  )
+) +
+  geom_point(
+    size = 3
+  ) +
+  geom_text(
+    vjust = -0.8,
+    size = 3,
+    check_overlap = TRUE
+  ) +
+  xlab(
+    paste0(
+      "PC1: ",
+      round(variance_eval[1], 1),
+      "% de varianza"
+    )
+  ) +
+  ylab(
+    paste0(
+      "PC2: ",
+      round(variance_eval[2], 1),
+      "% de varianza"
+    )
+  ) +
+  labs(
+    title = "PCA de GSE78220 con identificación de muestras",
+    color = "Respuesta"
+  ) +
+  theme_minimal()
+
+
+print(pca_eval_labels)
+
+############################################################
+# 19.5. AGREGACIÓN A NIVEL DE PACIENTE
+#
+# Algunas muestras, como Pt27A y Pt27B, corresponden a
+# biopsias diferentes del mismo paciente.
+#
+# Para evitar pseudorreplicación en la evaluación estadística,
+# cada paciente debe aportar una sola observación.
+#
+# Las biopsias múltiples de un mismo paciente se resumirán
+# mediante la media de su expresión log2(FPKM + 1).
+############################################################
+
+
+# ----------------------------------------------------------
+# 19.5.1. Crear identificador biológico de paciente
+#
+# Pt27A -> Pt27
+# Pt27B -> Pt27
+#
+# Las muestras sin sufijo permanecen iguales:
+# Pt1 -> Pt1
+# Pt2 -> Pt2
+# ----------------------------------------------------------
+
+meta_eval_expr <- meta_eval_expr %>%
+  mutate(
+    biological_patient_id = str_replace(
+      sample_id,
+      "^((?i:Pt)\\d+)[A-Z]$",
+      "\\1"
+    )
+  )
+
+
+# Revisar posibles pacientes con varias biopsias
+patient_sample_check <- meta_eval_expr %>%
+  count(
+    biological_patient_id,
+    name = "n_samples"
+  ) %>%
+  filter(
+    n_samples > 1
+  )
+
+cat("\nPacientes con más de una biopsia baseline:\n")
+print(patient_sample_check)
+
+
+# ----------------------------------------------------------
+# 19.5.2. Comprobar que biopsias del mismo paciente tienen
+#         la misma clasificación de respuesta
+# ----------------------------------------------------------
+
+patient_response_check_eval <- meta_eval_expr %>%
+  distinct(
+    biological_patient_id,
+    response_group
+  ) %>%
+  count(
+    biological_patient_id,
+    name = "n_response_groups"
+  ) %>%
+  filter(
+    n_response_groups > 1
+  )
+
+cat(
+  "\nPacientes con respuestas clínicas inconsistentes entre biopsias:\n"
+)
+
+print(patient_response_check_eval)
+
+
+# Debe ser cero.
+stopifnot(
+  nrow(patient_response_check_eval) == 0
+)
+
+
+# ----------------------------------------------------------
+# 19.5.3. Agregar expresión a nivel de paciente
+#
+# Primero convertimos la matriz a formato largo.
+# Después calculamos la media de expresión de las biopsias
+# correspondientes al mismo paciente.
+# ----------------------------------------------------------
+
+log_fpkm_long <- log_fpkm %>%
+  as.data.frame() %>%
+  rownames_to_column("SYMBOL") %>%
+  pivot_longer(
+    cols = -SYMBOL,
+    names_to = "sample_id",
+    values_to = "expression"
+  ) %>%
+  left_join(
+    meta_eval_expr %>%
+      select(
+        sample_id,
+        biological_patient_id
+      ),
+    by = "sample_id"
+  )
+
+
+# Media por gen y paciente
+log_fpkm_patient_df <- log_fpkm_long %>%
+  group_by(
+    SYMBOL,
+    biological_patient_id
+  ) %>%
+  summarise(
+    expression = mean(
+      expression,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = biological_patient_id,
+    values_from = expression
+  )
+
+
+# Convertir a matriz
+log_fpkm_patient <- log_fpkm_patient_df %>%
+  column_to_rownames("SYMBOL") %>%
+  as.matrix()
+
+
+storage.mode(log_fpkm_patient) <- "numeric"
+
+
+# ----------------------------------------------------------
+# 19.5.4. Crear metadatos a nivel de paciente
+# ----------------------------------------------------------
+
+meta_eval_patient <- meta_eval_expr %>%
+  distinct(
+    biological_patient_id,
+    response_group
+  )
+
+
+# Reordenar según la matriz
+meta_eval_patient <- meta_eval_patient[
+  match(
+    colnames(log_fpkm_patient),
+    meta_eval_patient$biological_patient_id
+  ),
+  ,
+  drop = FALSE
+]
+
+
+# Comprobación crítica
+stopifnot(
+  all(
+    colnames(log_fpkm_patient) ==
+      meta_eval_patient$biological_patient_id
+  )
+)
+
+
+cat(
+  "\nNúmero de pacientes independientes para priorización:",
+  ncol(log_fpkm_patient),
+  "\n"
+)
+
+cat("\nDistribución de respuesta a nivel de paciente:\n")
+
+print(
+  table(
+    meta_eval_patient$response_group
+  )
+)
+
+############################################################
+# 19.6. RESUMEN DE COMPARABILIDAD ENTRE COHORTES
+#
+# Se resumen las principales características metodológicas
+# y clínicas de las tres cohortes utilizadas en el estudio.
+#
+# GSE91061  -> descubrimiento transcriptómico
+# GSE78220  -> evaluación de reproducibilidad y priorización
+# GSE145996 -> evaluación externa retrospectiva in silico
+############################################################
+
+dataset_comparison <- data.frame(
+  
+  Dataset = c(
+    "GSE91061",
+    "GSE78220",
+    "GSE145996"
+  ),
+  
+  Funcion = c(
+    "Descubrimiento",
+    "Evaluación de reproducibilidad y priorización",
+    "Evaluación externa"
+  ),
+  
+  Enfermedad = c(
+    "Melanoma",
+    "Melanoma",
+    "Melanoma"
+  ),
+  
+  Tratamiento = c(
+    "Nivolumab",
+    "Pembrolizumab",
+    "Nivolumab / Pembrolizumab"
+  ),
+  
+  Tipo_dato = c(
+    "RNA-seq raw counts",
+    "RNA-seq FPKM",
+    "RNA-seq FPKM"
+  ),
+  
+  Momento_muestreo = c(
+    "Pretratamiento",
+    "Baseline",
+    "Pretratamiento"
+  ),
+  
+  Definicion_respuesta = c(
+    "CR/PR vs PD",
+    "CR/PR vs PD",
+    "CR/PR vs PD (principal); CR/PR vs SD/PD (sensibilidad)"
+  ),
+  
+  Unidad_analitica = c(
+    "Paciente",
+    "Paciente",
+    "Paciente"
+  ),
+  
+  Manejo_replicas = c(
+    "Una muestra Pre por paciente",
+    "Biopsias múltiples agregadas a nivel de paciente",
+    "Una muestra por paciente"
+  ),
+  
+  stringsAsFactors = FALSE
+)
+
+
+cat(
+  "\n========================================\n"
+)
+
+cat(
+  "COMPARABILIDAD ENTRE COHORTES\n"
+)
+
+cat(
+  "========================================\n\n"
+)
+
+
+print(
+  dataset_comparison
+)
+
+
+# Exportar tabla para documentación del TFM
+
+write.csv(
+  dataset_comparison,
+  "comparabilidad_cohortes_TFM.csv",
+  row.names = FALSE
+)
+
+
+############################################################
+# 20. ARMONIZACIÓN DE GSE91061 Y GSE78220
+#
+# GSE91061 utiliza Entrez IDs y posteriormente se anotó SYMBOL.
+# GSE78220 se armonizará con GSE91061 mediante SYMBOL
+# para evaluar reproducibilidad direccional y priorizar candidatos.
+#
+# NO se fusionarán ambas matrices debido a:
+#
+# - diferente estudio
+# - diferente procesamiento
+# - diferentes unidades
+#
+# La comparabilidad se evaluará a nivel de genes candidatos.
+############################################################
+
+
+# ----------------------------------------------------------
+# 20.1. Genes candidatos del descubrimiento
+# ----------------------------------------------------------
+
+candidate_genes <- deg %>%
+  filter(
+    !is.na(SYMBOL)
+  ) %>%
+  distinct(
+    SYMBOL,
+    .keep_all = TRUE
+  )
+
+
+cat(
+  "\nDEGs con símbolo génico disponibles para evaluación en GSE78220:",
+  nrow(candidate_genes),
+  "\n"
+)
+
+
+# ----------------------------------------------------------
+# 20.2. Genes presentes en GSE78220
+# ----------------------------------------------------------
+
+candidate_genes <- candidate_genes %>%
+  mutate(
+    present_in_evaluation =
+      SYMBOL %in%
+      rownames(log_fpkm_patient)
+  )
+
+
+cat(
+  "\nGenes candidatos presentes en GSE78220:",
+  sum(candidate_genes$present_in_evaluation),
+  "\n"
+)
+
+
+candidate_eval <- candidate_genes %>%
+  filter(
+    present_in_evaluation
+  )
+
+
+
+############################################################
+# 21. EVALUACIÓN DE REPRODUCIBILIDAD DE GENES CANDIDATOS
+#
+# La evaluación se realizará a nivel de paciente.
+#
+# Se compara la expresión entre Respondedores y
+# NonRespondedores mediante prueba no paramétrica de Wilcoxon.
+#
+# El objetivo no es realizar una validación confirmatoria,
+# sino evaluar:
+# - dirección del efecto
+# - consistencia entre cohortes
+# - evidencia estadística exploratoria
+############################################################
+
+
+# ----------------------------------------------------------
+# 21.1. Función de evaluación por gen
+# ----------------------------------------------------------
+
+evaluate_gene <- function(gene_symbol) {
+  
+  # Extraer expresión del gen a nivel de paciente
+  gene_values <- log_fpkm_patient[
+    gene_symbol,
+    ,
+    drop = TRUE
+  ]
+  
+  # Construir tabla de expresión + información clínica
+  tmp <- data.frame(
+    biological_patient_id = names(gene_values),
+    expression = as.numeric(gene_values)
+  ) %>%
+    left_join(
+      meta_eval_patient,
+      by = "biological_patient_id"
+    ) %>%
+    filter(
+      !is.na(response_group),
+      !is.na(expression)
+    )
+  
+  
+  # --------------------------------------------------------
+  # Separar grupos clínicos
+  # --------------------------------------------------------
+  
+  responder_values <- tmp$expression[
+    tmp$response_group == "Responder"
+  ]
+  
+  nonresponder_values <- tmp$expression[
+    tmp$response_group == "NonResponder"
+  ]
+  
+  
+  # --------------------------------------------------------
+  # Comprobar que ambos grupos tengan suficientes datos
+  # --------------------------------------------------------
+  
+  if (
+    length(responder_values) < 2 ||
+    length(nonresponder_values) < 2
+  ) {
+    
+    return(
+      data.frame(
+        
+        SYMBOL = gene_symbol,
+        
+        hl_estimate = NA_real_,
+        hl_ci_lower = NA_real_,
+        hl_ci_upper = NA_real_,
+        
+        reproducibility_p = NA_real_,
+        
+        median_responder = NA_real_,
+        median_nonresponder = NA_real_,
+        
+        iqr_responder = NA_real_,
+        iqr_nonresponder = NA_real_,
+        
+        mean_responder = NA_real_,
+        mean_nonresponder = NA_real_,
+        
+        n_responder = length(responder_values),
+        n_nonresponder = length(nonresponder_values)
+      )
+    )
+  }
+
+  # --------------------------------------------------------
+  # Estadísticos descriptivos
+  #
+  # Debido al carácter no paramétrico del análisis,
+  # la mediana y el rango intercuartílico (IQR) se utilizan
+  # como estadísticos descriptivos principales.
+  #
+  # Las medias se conservan únicamente como información
+  # descriptiva complementaria.
+  # --------------------------------------------------------
+  
+  median_responder <- median(
+    responder_values,
+    na.rm = TRUE
+  )
+  
+  median_nonresponder <- median(
+    nonresponder_values,
+    na.rm = TRUE
+  )
+  
+  
+  iqr_responder <- IQR(
+    responder_values,
+    na.rm = TRUE
+  )
+  
+  iqr_nonresponder <- IQR(
+    nonresponder_values,
+    na.rm = TRUE
+  )
+  
+  
+  mean_responder <- mean(
+    responder_values,
+    na.rm = TRUE
+  )
+  
+  mean_nonresponder <- mean(
+    nonresponder_values,
+    na.rm = TRUE
+  )
+
+  
+  # --------------------------------------------------------
+  # Prueba de Wilcoxon-Mann-Whitney y estimador
+  # de Hodges-Lehmann
+  #
+  # responder_values se introduce como primer grupo y
+  # nonresponder_values como segundo grupo.
+  #
+  # Por tanto:
+  #
+  # HL > 0  -> mayor expresión en Respondedores
+  # HL < 0  -> mayor expresión en NonRespondedores
+  #
+  # Se obtiene además el intervalo de confianza del 95 %.
+  # --------------------------------------------------------
+  
+  wilcox_res <- tryCatch(
+    
+    wilcox.test(
+      responder_values,
+      nonresponder_values,
+      exact = FALSE,
+      conf.int = TRUE,
+      conf.level = 0.95
+    ),
+    
+    error = function(e) NULL
+  )
+  
+  # --------------------------------------------------------
+  # Extraer p-valor, estimador de Hodges-Lehmann
+  # e intervalo de confianza
+  # --------------------------------------------------------
+  
+  if (!is.null(wilcox_res)) {
+    
+    reproducibility_p <- wilcox_res$p.value
+    
+    
+    if (!is.null(wilcox_res$estimate)) {
+      
+      hl_estimate <- as.numeric(
+        wilcox_res$estimate
+      )
+      
+    } else {
+      
+      hl_estimate <- NA_real_
+    }
+    
+    
+    if (
+      !is.null(wilcox_res$conf.int) &&
+      length(wilcox_res$conf.int) == 2
+    ) {
+      
+      hl_ci_lower <- as.numeric(
+        wilcox_res$conf.int[1]
+      )
+      
+      hl_ci_upper <- as.numeric(
+        wilcox_res$conf.int[2]
+      )
+      
+    } else {
+      
+      hl_ci_lower <- NA_real_
+      hl_ci_upper <- NA_real_
+    }
+    
+  } else {
+    
+    reproducibility_p <- NA_real_
+    hl_estimate <- NA_real_
+    hl_ci_lower <- NA_real_
+    hl_ci_upper <- NA_real_
+  }
+  
+  # --------------------------------------------------------
+  # Resultado
+  # --------------------------------------------------------
+  
+  data.frame(
+    
+    SYMBOL = gene_symbol,
+    
+    # Efecto principal no paramétrico
+    hl_estimate = hl_estimate,
+    hl_ci_lower = hl_ci_lower,
+    hl_ci_upper = hl_ci_upper,
+    
+    # Evidencia estadística
+    reproducibility_p = reproducibility_p,
+    
+    # Descriptivos principales
+    median_responder = median_responder,
+    median_nonresponder = median_nonresponder,
+    
+    iqr_responder = iqr_responder,
+    iqr_nonresponder = iqr_nonresponder,
+    
+    # Descriptivos complementarios
+    mean_responder = mean_responder,
+    mean_nonresponder = mean_nonresponder,
+    
+    # Tamaño de grupos
+    n_responder = length(
+      responder_values
+    ),
+    
+    n_nonresponder = length(
+      nonresponder_values
+    )
+  )
+}
+
+############################################################
+# 21.2. Aplicar evaluación a todos los candidatos
+############################################################
+
+reproducibility_results <- bind_rows(
+  lapply(
+    candidate_eval$SYMBOL,
+    evaluate_gene
+  )
+)
+
+
+# Corregir múltiples comparaciones
+
+reproducibility_results$reproducibility_padj <-
+   p.adjust(
+    reproducibility_results$reproducibility_p,
+    method = "BH"
+  )
+
+
+############################################################
+# 21.3. Integrar descubrimiento y evaluación de
+#       reproducibilidad
+############################################################
+
+candidate_reproducibility <- candidate_eval %>%
+  left_join(
+    reproducibility_results,
+    by = "SYMBOL"
+  ) %>%
+  mutate(
+    
+    discovery_direction =
+      case_when(
+        
+        log2FoldChange > 0 ~ "Responder",
+        
+        log2FoldChange < 0 ~ "NonResponder",
+        
+        TRUE ~ NA_character_
+      ),
+    
+    
+    reproducibility_direction =
+      case_when(
+        
+        hl_estimate > 0 ~ "Responder",
+        
+        hl_estimate < 0 ~ "NonResponder",
+        
+        TRUE ~ NA_character_
+      ),
+    
+    
+    direction_consistent =
+      discovery_direction ==
+      reproducibility_direction
+  )
+
+
+cat(
+  "\nGenes con dirección consistente entre cohortes:\n"
+)
+
+print(
+  table(
+    candidate_reproducibility$direction_consistent,
+    useNA = "ifany"
+  )
+)
+
+
+############################################################
+# 22. PRIORIZACIÓN DE BIOMARCADORES CANDIDATOS
+#
+# Se conservan únicamente genes con dirección de efecto
+# consistente entre GSE91061 y GSE78220.
+#
+# Dentro de este conjunto, los genes se ordenan según:
+#
+# 1. evidencia estadística exploratoria en GSE78220
+#    (menor reproducibility_p);
+#
+# 2. significación en la cohorte de descubrimiento GSE91061
+#    (menor padj).
+#
+# reproducibility_p < 0.05 se considera únicamente evidencia
+# de apoyo y no un criterio de validación confirmatoria.
+#
+# La priorización integra:
+#
+# 1. Significación en GSE91061
+# 2. Presencia en GSE78220
+# 3. Dirección consistente entre cohortes
+# 4. Evidencia estadística exploratoria en GSE78220
+#
+# IMPORTANTE:
+# GSE78220 tiene un tamaño muestral reducido.
+# Por ello, reproducibility_p < 0.05 se utilizará únicamente
+# como criterio de apoyo exploratorio.
+############################################################
+
+prioritized_genes <- candidate_reproducibility %>%
+  filter(
+    direction_consistent == TRUE,
+    !is.na(reproducibility_p)
+  ) %>%
+  mutate(
+    reproducibility_support = reproducibility_p < 0.05
+  ) %>%
+  arrange(
+    desc(reproducibility_support),
+    reproducibility_p,
+    padj
+  )
+
+
+cat(
+  "\nNúmero de genes con dirección consistente:",
+  nrow(prioritized_genes),
+  "\n"
+)
+
+cat(
+  "Genes con p < 0.05 en la cohorte de priorización:",
+  sum(prioritized_genes$reproducibility_support, na.rm = TRUE),
+  "\n"
+)
+
+# ----------------------------------------------------------
+# 22.1. VISUALIZAR RANKING COMPLETO DE GENES PRIORIZADOS
+#
+# Los genes con dirección consistente se muestran ordenados
+# según:
+#
+# 1. apoyo estadístico exploratorio en GSE78220
+# 2. menor p de priorización
+# 3. menor padj en GSE91061
+#
+# Esta tabla permite documentar de forma transparente
+# la selección posterior de la firma génica candidata.
+# ----------------------------------------------------------
+
+cat(
+  "\nRanking completo de genes priorizados:\n"
+)
+
+print(
+  prioritized_genes %>%
+    select(
+      SYMBOL,
+      
+      # Descubrimiento GSE91061
+      log2FoldChange,
+      padj,
+      
+      # Efecto no paramétrico GSE78220
+      hl_estimate,
+      hl_ci_lower,
+      hl_ci_upper,
+      
+      # Descriptivos principales
+      median_responder,
+      median_nonresponder,
+      iqr_responder,
+      iqr_nonresponder,
+      
+      # Descriptivos complementarios
+      mean_responder,
+      mean_nonresponder,
+      
+      # Inferencia
+      reproducibility_p,
+      reproducibility_padj,
+      
+      # Dirección entre cohortes
+      discovery_direction,
+      reproducibility_direction,
+      direction_consistent,
+      
+      # Evidencia exploratoria
+      reproducibility_support
+    )
+)
+
+
+############################################################
+# 23. SELECCIÓN DE FIRMA GÉNICA CANDIDATA
+#
+# Se selecciona un conjunto pequeño para reducir el riesgo
+# de sobreajuste.
+#
+# La selección final deberá interpretarse junto con:
+# - GO/KEGG
+# - literatura científica
+# - consistencia entre las dos cohortes
+############################################################
+
+genes_supported <- prioritized_genes %>%
+  filter(reproducibility_support)
+
+
+if (nrow(genes_supported) >= 2) {
+  
+  # Seleccionar como máximo 10 genes
+  signature_genes <- genes_supported %>%
+    slice_head(
+      n = min(10, nrow(genes_supported))
+    )
+  
+} else {
+  
+  warning(
+    "Menos de dos genes presentan p < 0.05 en GSE78220. ",
+    "Se construirá una firma exploratoria utilizando los genes ",
+    "con dirección consistente entre cohortes y mejor evidencia ",
+    "estadística exploratoria en GSE78220."
+  )
+  
+  signature_genes <- prioritized_genes %>%
+    slice_head(
+      n = min(5, nrow(prioritized_genes))
+    )
+}
+
+
+# Comprobar que exista al menos un gen candidato
+stopifnot(nrow(signature_genes) > 0)
+
+
+cat("\nGenes seleccionados para la firma candidata:\n")
+
+print(
+  signature_genes %>%
+    select(
+      SYMBOL,
+      GENENAME,
+      log2FoldChange,
+      padj,
+      hl_estimate,
+      hl_ci_lower,
+      hl_ci_upper,
+      median_responder,
+      median_nonresponder,
+      iqr_responder,
+      iqr_nonresponder,
+      reproducibility_p,
+      reproducibility_padj,
+      direction_consistent
+    )
+)
+
+
+############################################################
+# 23.1. CONGELAR LA FIRMA ANTES DE LA EVALUACIÓN EXTERNA
+#
+# IMPORTANTE:
+#
+# A partir de este momento NO se modificará:
+#
+# - número de genes
+# - identidad de los genes
+# - dirección de los pesos
+#
+# utilizando información de GSE145996.
+#
+# Esto mantiene la independencia de la cohorte externa.
+############################################################
+
+final_signature <- signature_genes %>%
+  filter(
+    !is.na(SYMBOL)
+  ) %>%
+  distinct(
+    SYMBOL,
+    .keep_all = TRUE
+  ) %>%
+  mutate(
+    weight = ifelse(
+      log2FoldChange > 0,
+      1,
+      -1
+    )
+  )
+
+
+cat("\nFirma congelada antes de evaluación externa:\n")
+
+print(
+  final_signature %>%
+    select(
+      SYMBOL,
+      GENENAME,
+      log2FoldChange,
+      padj,
+      hl_estimate,
+      hl_ci_lower,
+      hl_ci_upper,
+      reproducibility_p,
+      reproducibility_padj,
+      weight
+    )
+)
+
+
+# Guardar para trazabilidad
+write.csv(
+  final_signature,
+  "firma_congelada_pre_evaluacion_externa.csv",
+  row.names = FALSE
+)
+
+############################################################
+# 23.2. ANOTACIÓN GÉNICA DE LOS GENES DE LA FIRMA
+############################################################
+
+signature_annotation <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = final_signature$SYMBOL,
+  keytype = "SYMBOL",
+  columns = c(
+    "SYMBOL",
+    "GENENAME",
+    "ENTREZID"
+  )
+)
+
+signature_annotation <- signature_annotation %>%
+  distinct(
+    SYMBOL,
+    .keep_all = TRUE
+  )
+
+signature_biology <- final_signature %>%
+  left_join(
+    signature_annotation,
+    by = "SYMBOL",
+    suffix = c("", "_annotation")
+  )
+
+print(signature_biology)
+
+write.csv(
+  signature_biology,
+  "anotacion_biologica_firma_genica.csv",
+  row.names = FALSE
+)
+
+############################################################
+# 24. CONGELACIÓN COMPLETA DE LOS PARÁMETROS DE LA FIRMA
+#
+# Antes de acceder a la cohorte externa GSE145996 se fijan:
+#
+# - genes de la firma
+# - dirección/pesos
+# - media de referencia
+# - desviación estándar de referencia
+#
+# Las medias y desviaciones se calculan exclusivamente
+# utilizando GSE78220.
+#
+# A partir del apartado 25 ningún componente de la firma
+# podrá modificarse utilizando información de GSE145996.
+############################################################
+
+# Comprobar que todos los genes congelados existen
+# en la matriz de referencia GSE78220
+
+stopifnot(
+  all(
+    final_signature$SYMBOL %in%
+      rownames(log_fpkm_patient)
+  )
+)
+
+stopifnot(
+  !anyDuplicated(
+    final_signature$SYMBOL
+  )
+)
+
+# ----------------------------------------------------------
+# 24.1. Extraer genes de la firma en GSE78220
+# ----------------------------------------------------------
+
+signature_reference_matrix <- log_fpkm_patient[
+  final_signature$SYMBOL,
+  ,
+  drop = FALSE
+]
+
+stopifnot(
+  all(
+    rownames(signature_reference_matrix) ==
+      final_signature$SYMBOL
+  )
+)
+
+# ----------------------------------------------------------
+# 24.2. Calcular media y desviación estándar
+#       exclusivamente con GSE78220
+# ----------------------------------------------------------
+
+signature_center <- rowMeans(
+  signature_reference_matrix,
+  na.rm = TRUE
+)
+
+
+signature_scale <- apply(
+  signature_reference_matrix,
+  1,
+  sd,
+  na.rm = TRUE
+)
+
+
+# Comprobar desviaciones
+stopifnot(
+  all(
+    is.finite(signature_scale)
+  )
+)
+
+stopifnot(
+  all(
+    signature_scale > 0
+  )
+)
+
+
+# ----------------------------------------------------------
+# 24.3. Definir pesos congelados
+#
+# +1 = asociado a respuesta
+# -1 = asociado a no respuesta
+# ----------------------------------------------------------
+
+signature_weights <- ifelse(
+  final_signature$log2FoldChange > 0,
+  1,
+  -1
+)
+
+
+names(signature_weights) <-
+  final_signature$SYMBOL
+
+
+# Reordenar todo exactamente igual
+signature_center <-
+  signature_center[
+    final_signature$SYMBOL
+  ]
+
+signature_scale <-
+  signature_scale[
+    final_signature$SYMBOL
+  ]
+
+signature_weights <-
+  signature_weights[
+    final_signature$SYMBOL
+  ]
+
+
+cat(
+  "\nParámetros de firma congelados correctamente.\n"
+)
+
+
+############################################################
+# 25. DESCARGA DE LA COHORTE EXTERNA GSE145996
+#
+# Esta cohorte NO participará en:
+#
+# - descubrimiento de DEGs
+# - selección de genes
+# - definición de pesos
+#
+# Se utilizará exclusivamente para evaluar externamente
+# la firma previamente congelada.
+############################################################
+
+gse_ext <- getGEO(
+  "GSE145996",
+  GSEMatrix = TRUE, getGPL = FALSE
+)
+
+eset_ext <- gse_ext[[1]]
+
+meta_ext_raw <- pData(
+  eset_ext
+)
+
+
+cat("\nDimensiones de metadatos GSE145996:\n")
+print(dim(meta_ext_raw))
+
+
+cat("\nColumnas disponibles:\n")
+print(colnames(meta_ext_raw))
+
+# Buscar columnas de características clínicas
+char_cols_ext <- grep(
+  "characteristics",
+  colnames(meta_ext_raw),
+  value = TRUE
+)
+
+print(char_cols_ext)
+
+# Mostrar los valores contenidos en cada columna clínica
+for (cc in char_cols_ext) {
+  
+  cat("\n---", cc, "---\n")
+  
+  print(
+    unique(
+      meta_ext_raw[[cc]]
+    )
+  )
+}
+
+############################################################
+# 25.1. INSPECCIONAR IDENTIFICADORES DE LAS 14 MUESTRAS
+############################################################
+
+cat("\nMuestras RNA-seq presentes en GSE145996:\n")
+
+print(
+  meta_ext_raw %>%
+    as.data.frame() %>%
+    select(
+      geo_accession,
+      title
+    )
+)
+
+
+############################################################
+# 25.2. REVISAR CAMPOS QUE PODRÍAN CONTENER INFORMACIÓN
+#       ADICIONAL DE LA MUESTRA
+############################################################
+
+cat("\nColumnas relation:\n")
+
+print(
+  meta_ext_raw %>%
+    as.data.frame() %>%
+    select(
+      geo_accession,
+      title,
+      relation,
+      relation.1
+    )
+)
+
+
+############################################################
+# 25.3. REVISAR TEXTO COMPLETO DE METADATOS
+############################################################
+
+# Buscar cualquier columna que contenga términos relacionados
+# con respuesta clínica.
+
+response_search <- sapply(
+  meta_ext_raw,
+  function(x) {
+    any(
+      grepl(
+        "response|responder|non-responder|complete|partial|progressive|stable|CR|PR|SD|PD",
+        as.character(x),
+        ignore.case = TRUE
+      ),
+      na.rm = TRUE
+    )
+  }
+)
+
+cat("\nColumnas con posibles términos relacionados con respuesta:\n")
+
+print(
+  names(
+    response_search[
+      response_search
+    ]
+  )
+)
+
+############################################################
+# 25.4. DESCARGAR ARCHIVO PROCESADO DE EXPRESIÓN
+############################################################
+
+getGEOSuppFiles(
+  "GSE145996",
+  makeDirectory = TRUE
+)
+
+
+cat("\nArchivos descargados:\n")
+
+print(
+  list.files(
+    "GSE145996",
+    recursive = TRUE
+  )
+)
+
+############################################################
+# 25.5. LEER MATRIZ FPKM
+############################################################
+
+fpkm_ext_raw <- read.delim(
+  "GSE145996/GSE145996_Melanoma_Immune_FPKM.txt.gz",
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+
+cat("\nDimensiones del archivo FPKM:\n")
+print(dim(fpkm_ext_raw))
+
+
+cat("\nPrimeras columnas:\n")
+print(colnames(fpkm_ext_raw))
+
+
+cat("\nPrimeras filas:\n")
+print(head(fpkm_ext_raw))
+
+############################################################
+# 25.6. CONSTRUIR TABLA CLÍNICA DE GSE145996
+#
+# Información obtenida de las tablas suplementarias
+# originales de Amato et al.:
+#
+# Supplemental Table 1:
+# - Patient Number
+# - Drug
+# - Best Response
+#
+# Supplemental Table 2:
+# - Patient Number
+# - Tumor ID number
+# - RNASEQ
+#
+# Se cruzaron únicamente los especímenes con RNASEQ = 1.
+############################################################
+
+clinical_ext <- data.frame(
+  
+  tumor_id = c(
+    "MB1692",
+    "MB2781",
+    "MB2786",
+    "MB2674",
+    "MB2750",
+    "MB2855",
+    "MB1882",
+    "MB3025",
+    "MB3178",
+    "MB3432",
+    "MB3316",
+    "MB3838",
+    "MB4103",
+    "MB4117"
+  ),
+  
+  patient_id = c(
+    "P0112",
+    "P0187",
+    "P0195",
+    "P0199",
+    "P0200",
+    "P0243",
+    "P0268",
+    "P0315",
+    "P0349",
+    "P0370",
+    "P0375",
+    "P0418",
+    "P0487",
+    "P0488"
+  ),
+  
+  drug = c(
+    "Pembrolizumab",
+    "Pembrolizumab",
+    "Pembrolizumab",
+    "Pembrolizumab",
+    "Pembrolizumab",
+    "Pembrolizumab",
+    "Pembrolizumab",
+    "Pembrolizumab",
+    "Pembrolizumab",
+    "Pembrolizumab",
+    "Nivolumab",
+    "Nivolumab",
+    "Pembrolizumab",
+    "Pembrolizumab"
+  ),
+  
+  best_response = c(
+    "CR",
+    "PR",
+    "PD",
+    "CR",
+    "PR",
+    "PD",
+    "PR",
+    "PR",
+    "PR",
+    "PD",
+    "PD",
+    "SD",
+    "PR",
+    "PD"
+  ),
+  
+  stringsAsFactors = FALSE
+)
+
+############################################################
+# 25.7. DEFINICIÓN DE RESPUESTA CLÍNICA
+#
+# Se construyen dos variables de respuesta:
+#
+# response_group_primary:
+#   CR/PR -> Responder
+#   PD    -> NonResponder
+#   SD    -> excluido
+#
+# Esta definición reproduce exactamente el contraste
+# utilizado durante descubrimiento y priorización.
+#
+# response_group_objective:
+#   CR/PR -> Responder
+#   SD/PD -> NonResponder
+#
+# Clasificación basada en presencia o ausencia de respuesta
+# objetiva:
+#
+# CR/PR -> Responder (respuesta objetiva)
+# SD/PD -> NonResponder (sin respuesta objetiva)
+#
+# Esta segunda clasificación se utilizará únicamente
+# como análisis de sensibilidad.
+############################################################
+
+clinical_ext <- clinical_ext %>%
+  mutate(
+    
+    response_group_primary = case_when(
+      
+      best_response %in% c("CR", "PR") ~
+        "Responder",
+      
+      best_response == "PD" ~
+        "NonResponder",
+      
+      TRUE ~
+        NA_character_
+    ),
+    
+    response_group_objective = case_when(
+      
+      best_response %in% c("CR", "PR") ~
+        "Responder",
+      
+      best_response %in% c("SD", "PD") ~
+        "NonResponder",
+      
+      TRUE ~
+        NA_character_
+    )
+  )
+
+
+clinical_ext$response_group_primary <- factor(
+  clinical_ext$response_group_primary,
+  levels = c(
+    "NonResponder",
+    "Responder"
+  )
+)
+
+
+clinical_ext$response_group_objective <- factor(
+  clinical_ext$response_group_objective,
+  levels = c(
+    "NonResponder",
+    "Responder"
+  )
+)
+
+cat("\nRespuesta primaria CR/PR vs PD:\n")
+
+print(
+  table(
+    clinical_ext$response_group_primary,
+    useNA = "ifany"
+  )
+)
+
+cat("\nRespuesta objetiva CR/PR vs SD/PD:\n")
+
+print(
+  table(
+    clinical_ext$response_group_objective,
+    useNA = "ifany"
+  )
+)
+
+
+############################################################
+# 25.8. COMPROBACIONES DE LA COHORTE CLÍNICA
+############################################################
+
+cat("\nDistribución de respuesta original:\n")
+
+print(
+  table(
+    clinical_ext$best_response
+  )
+)
+
+
+cat("\nDistribución análisis principal CR/PR vs PD:\n")
+
+print(
+  table(
+    clinical_ext$response_group_primary,
+    useNA = "ifany"
+  )
+)
+
+
+cat("\nDistribución análisis de sensibilidad CR/PR vs SD/PD:\n")
+
+print(
+  table(
+    clinical_ext$response_group_objective,
+    useNA = "ifany"
+  )
+)
+
+
+cat("\nNúmero de pacientes:\n")
+
+print(
+  length(
+    unique(
+      clinical_ext$patient_id
+    )
+  )
+)
+
+
+cat("\nNúmero de muestras tumorales:\n")
+
+print(
+  length(
+    unique(
+      clinical_ext$tumor_id
+    )
+  )
+)
+
+
+############################################################
+# 25.9. RELACIONAR METADATOS CLÍNICOS CON LA MATRIZ FPKM
+#
+# Las columnas de expresión tienen nombres como:
+#
+# Sample_01_MB_1692
+# Sample_02_MB_2674
+# ...
+#
+# Mientras que clinical_ext utiliza:
+#
+# MB1692
+# MB2674
+#
+# Se extraerá el identificador MB de cada columna.
+############################################################
+
+sample_map_ext <- data.frame(
+  
+  expression_id = colnames(fpkm_ext_raw)[-c(1, 2)],
+  
+  stringsAsFactors = FALSE
+  
+) %>%
+  mutate(
+    
+    # Extraer identificador MB
+    tumor_id = str_extract(
+      expression_id,
+      "MB_?\\d+"
+    ),
+    
+    # Homogeneizar:
+    #
+    # MB_1692 -> MB1692
+    # MB1692  -> MB1692
+    
+    tumor_id = str_remove(
+      tumor_id,
+      "_"
+    )
+  )
+
+
+cat("\nCorrespondencia expresión - tumor ID:\n")
+
+print(
+  sample_map_ext
+)
+
+
+############################################################
+# 25.10. UNIR INFORMACIÓN DE EXPRESIÓN Y RESPUESTA CLÍNICA
+############################################################
+
+meta_ext_final <- sample_map_ext %>%
+  left_join(
+    clinical_ext,
+    by = "tumor_id"
+  )
+
+
+cat("\nTabla clínica final de las muestras RNA-seq:\n")
+
+print(
+  meta_ext_final
+)
+
+
+############################################################
+# 25.11. COMPROBACIONES DE CORRESPONDENCIA
+############################################################
+
+# Deben existir exactamente 14 muestras RNA-seq
+stopifnot(
+  nrow(meta_ext_final) == 14
+)
+
+# Todas deben tener respuesta clínica original
+stopifnot(
+  !anyNA(meta_ext_final$best_response)
+)
+
+# La definición de sensibilidad debe existir para las 14
+stopifnot(
+  !anyNA(meta_ext_final$response_group_objective)
+)
+
+# La definición principal debe contener exactamente un NA,
+# correspondiente al único paciente con SD
+stopifnot(
+  sum(is.na(meta_ext_final$response_group_primary)) == 1
+)
+
+# Cada tumor debe aparecer una sola vez
+stopifnot(
+  !anyDuplicated(meta_ext_final$tumor_id)
+)
+
+# Cada paciente debe aparecer una sola vez
+stopifnot(
+  !anyDuplicated(meta_ext_final$patient_id)
+)
+
+# Las 14 columnas de expresión deben haber sido mapeadas
+stopifnot(
+  setequal(
+    sample_map_ext$expression_id,
+    colnames(fpkm_ext_raw)[-c(1, 2)]
+  )
+)
+
+cat(
+  "\nCORRECTO: las 14 muestras RNA-seq corresponden ",
+  "a 14 pacientes independientes y disponen de ",
+  "información clínica válida.\n"
+)
+
+
+cat("\nDistribución final - análisis principal:\n")
+
+print(
+  table(
+    meta_ext_final$response_group_primary,
+    useNA = "ifany"
+  )
+)
+
+
+cat("\nDistribución final - análisis de sensibilidad:\n")
+
+print(
+  table(
+    meta_ext_final$response_group_objective,
+    useNA = "ifany"
+  )
+)
+
+
+############################################################
+# 26. CONSTRUCCIÓN DE LA MATRIZ DE EXPRESIÓN GSE145996
+#
+# El archivo contiene:
+#
+# columna 1 = Gene Name
+# columna 2 = Locus
+# columnas 3-16 = 14 muestras RNA-seq
+#
+# Se utilizarán únicamente símbolos génicos inequívocos.
+#
+# Las filas que contienen varios genes separados por coma
+# no se asignarán artificialmente a genes individuales.
+############################################################
+
+
+# ----------------------------------------------------------
+# 26.1. Seleccionar genes y columnas de expresión
+# ----------------------------------------------------------
+
+fpkm_ext_df <- fpkm_ext_raw %>%
+  select(
+    `Gene Name`,
+    all_of(meta_ext_final$expression_id)
+  ) %>%
+  as.data.frame()
+
+
+# Renombrar la columna génica
+colnames(fpkm_ext_df)[1] <- "SYMBOL"
+
+
+# ----------------------------------------------------------
+# 26.2. Limpiar símbolos génicos
+# ----------------------------------------------------------
+
+fpkm_ext_df$SYMBOL <- str_trim(
+  as.character(fpkm_ext_df$SYMBOL)
+)
+
+
+# Eliminar genes sin símbolo
+fpkm_ext_df <- fpkm_ext_df %>%
+  filter(
+    !is.na(SYMBOL),
+    SYMBOL != ""
+  )
+
+
+# ----------------------------------------------------------
+# 26.3. Excluir identificadores ambiguos
+#
+# Ejemplo:
+#
+# MIR4647,NFKBIE,SLC35B2
+#
+# representa una fila asociada a varios genes y no debe
+# utilizarse para validar un biomarcador individual.
+# ----------------------------------------------------------
+
+ambiguous_gene_rows <- str_detect(
+  fpkm_ext_df$SYMBOL,
+  ","
+)
+
+
+cat(
+  "\nFilas con múltiples símbolos génicos:",
+  sum(ambiguous_gene_rows),
+  "\n"
+)
+
+
+fpkm_ext_df <- fpkm_ext_df %>%
+  filter(
+    !str_detect(SYMBOL, ",")
+  )
+
+
+# ----------------------------------------------------------
+# 26.4. Convertir expresión a formato numérico
+# ----------------------------------------------------------
+
+sample_columns_ext <- meta_ext_final$expression_id
+
+
+fpkm_ext_df <- fpkm_ext_df %>%
+  mutate(
+    across(
+      all_of(sample_columns_ext),
+      as.numeric
+    )
+  )
+
+
+# ----------------------------------------------------------
+# 26.5. Resolver símbolos duplicados
+#
+# Si un mismo símbolo aparece en varias filas inequívocas,
+# se calcula la expresión media.
+# ----------------------------------------------------------
+
+fpkm_ext_df <- fpkm_ext_df %>%
+  group_by(SYMBOL) %>%
+  summarise(
+    across(
+      all_of(sample_columns_ext),
+      ~ mean(.x, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  )
+
+
+# ----------------------------------------------------------
+# 26.6. Crear matriz genes × muestras
+# ----------------------------------------------------------
+
+fpkm_ext <- fpkm_ext_df %>%
+  column_to_rownames("SYMBOL") %>%
+  as.matrix()
+
+
+storage.mode(fpkm_ext) <- "numeric"
+
+
+# ----------------------------------------------------------
+# 26.7. Comprobaciones
+# ----------------------------------------------------------
+
+stopifnot(
+  ncol(fpkm_ext) == 14
+)
+
+stopifnot(
+  !anyNA(fpkm_ext)
+)
+
+stopifnot(
+  all(fpkm_ext >= 0)
+)
+
+stopifnot(
+  all(
+    colnames(fpkm_ext) ==
+      meta_ext_final$expression_id
+  )
+)
+
+
+cat(
+  "\nDimensiones finales de GSE145996:\n"
+)
+
+print(
+  dim(fpkm_ext)
+)
+
+
+cat(
+  "\nCORRECTO: matriz FPKM externa construida y alineada.\n"
+)
+
+
+############################################################
+# 27. PREPROCESAMIENTO DE GSE145996
+#
+# Se transforma:
+#
+# FPKM -> log2(FPKM + 1)
+#
+# Esta transformación se aplica antes de utilizar la firma.
+############################################################
+
+# ----------------------------------------------------------
+# 27.1. Transformación
+# ----------------------------------------------------------
+
+log_fpkm_ext <- log2(
+  fpkm_ext + 1
+)
+
+
+# Comprobar integridad
+stopifnot(
+  all(
+    is.finite(log_fpkm_ext)
+  )
+)
+
+
+cat(
+  "\nResumen de expresión log2(FPKM + 1):\n"
+)
+
+print(
+  summary(
+    as.numeric(log_fpkm_ext)
+  )
+)
+
+
+# ----------------------------------------------------------
+# 27.2. Proporción de ceros
+# ----------------------------------------------------------
+
+zero_fraction_ext <- colMeans(
+  fpkm_ext == 0
+)
+
+
+qc_ext <- data.frame(
+  
+  expression_id =
+    colnames(fpkm_ext),
+  
+  zero_fraction =
+    zero_fraction_ext
+  
+) %>%
+  
+  left_join(
+    meta_ext_final %>%
+      select(
+        expression_id,
+        patient_id,
+        response_group_primary,
+        response_group_objective
+      ),
+    by = "expression_id"
+  )
+
+
+cat(
+  "\nResumen de proporción de ceros:\n"
+)
+
+print(
+  summary(
+    qc_ext$zero_fraction
+  )
+)
+
+
+print(
+  qc_ext %>%
+    arrange(
+      desc(zero_fraction)
+    )
+)
+
+
+############################################################
+# 28. COMPROBAR FIRMA CONGELADA EN GSE145996
+#
+# GSE145996 NO participa en:
+#
+# - descubrimiento de genes
+# - selección de biomarcadores
+# - elección del número de genes
+# - definición de dirección/pesos
+############################################################
+
+
+stopifnot(
+  exists("final_signature")
+)
+
+
+cat(
+  "\nGenes de la firma previamente congelada:\n"
+)
+
+print(
+  final_signature$SYMBOL
+)
+
+
+# ----------------------------------------------------------
+# 28.1. Comprobar presencia de genes
+# ----------------------------------------------------------
+
+signature_presence_ext <- data.frame(
+  
+  SYMBOL =
+    final_signature$SYMBOL,
+  
+  present_in_GSE145996 =
+    final_signature$SYMBOL %in%
+    rownames(log_fpkm_ext)
+  
+)
+
+
+print(
+  signature_presence_ext
+)
+
+
+missing_signature_genes <- signature_presence_ext %>%
+  filter(
+    !present_in_GSE145996
+  )
+
+
+cat(
+  "\nGenes de la firma ausentes en GSE145996:\n"
+)
+
+print(
+  missing_signature_genes
+)
+
+
+if (
+  nrow(missing_signature_genes) > 0
+) {
+  
+  stop(
+    "La firma congelada no está completamente representada ",
+    "en GSE145996. Debe revisarse antes de continuar con ",
+    "la evaluación externa."
+  )
+  
+}
+
+cat("\nNúmero de genes de la firma:", nrow(final_signature), "\n")
+
+cat(
+  "Genes presentes en GSE145996:",
+  sum(signature_presence_ext$present_in_GSE145996),
+  "\n"
+)
+
+cat(
+  "Genes ausentes:",
+  nrow(missing_signature_genes),
+  "\n"
+)
+
+
+############################################################
+# 29. APLICACIÓN DE LA FIRMA A GSE145996
+#
+# No se reentrena ningún modelo.
+# No se seleccionan genes.
+# No se recalculan pesos.
+#
+# Se aplican directamente los parámetros congelados.
+############################################################
+
+# ----------------------------------------------------------
+# 29.1. Extraer expresión de genes de la firma
+# ----------------------------------------------------------
+
+external_signature_matrix <- log_fpkm_ext[
+  final_signature$SYMBOL,
+  ,
+  drop = FALSE
+]
+
+
+# Comprobar orden
+stopifnot(
+  all(
+    rownames(external_signature_matrix) ==
+      final_signature$SYMBOL
+  )
+)
+
+# ----------------------------------------------------------
+# 29.2. Estandarizar utilizando parámetros de GSE78220
+#
+# (x - media_entrenamiento) / SD_entrenamiento
+# ----------------------------------------------------------
+
+external_signature_z <- sweep(
+  external_signature_matrix,
+  1,
+  signature_center,
+  "-"
+)
+
+
+external_signature_z <- sweep(
+  external_signature_z,
+  1,
+  signature_scale,
+  "/"
+)
+
+
+stopifnot(
+  all(
+    is.finite(
+      external_signature_z
+    )
+  )
+)
+
+
+# ----------------------------------------------------------
+# 29.3. Aplicar pesos congelados
+# ----------------------------------------------------------
+
+weighted_external <- external_signature_z *
+  signature_weights[
+    rownames(external_signature_z)
+  ]
+
+
+# ----------------------------------------------------------
+# 29.4. Calcular score
+# ----------------------------------------------------------
+
+external_score <- colMeans(
+  weighted_external,
+  na.rm = TRUE
+)
+
+
+# ----------------------------------------------------------
+# 29.5. Asociar respuesta clínica
+# ----------------------------------------------------------
+
+external_score_df <- data.frame(
+  
+  expression_id =
+    names(external_score),
+  
+  signature_score =
+    as.numeric(external_score)
+  
+) %>%
+  
+  left_join(
+    meta_ext_final %>%
+      select(
+        expression_id,
+        tumor_id,
+        patient_id,
+        drug,
+        best_response,
+        response_group_primary,
+        response_group_objective
+      ),
+    by = "expression_id"
+  )
+
+
+# Comprobaciones
+
+stopifnot(
+  nrow(external_score_df) == 14
+)
+
+stopifnot(
+  !anyNA(external_score_df$best_response)
+)
+
+stopifnot(
+  !anyNA(external_score_df$response_group_objective)
+)
+
+stopifnot(
+  sum(is.na(external_score_df$response_group_primary)) == 1
+)
+
+
+cat(
+  "\nScore externo calculado para 14 pacientes.\n"
+)
+
+print(
+  external_score_df
+)
+
+############################################################
+# 29.6. DEFINIR COHORTE DE EVALUACIÓN EXTERNA PRINCIPAL
+#
+# El análisis principal mantiene exactamente la definición
+# utilizada en GSE91061 y GSE78220:
+#
+# CR / PR -> Responder
+# PD      -> NonResponder
+# SD      -> excluido
+############################################################
+
+external_primary <- external_score_df %>%
+  filter(
+    !is.na(response_group_primary)
+  )
+
+
+cat("\nDistribución de la cohorte externa principal:\n")
+
+print(
+  table(
+    external_primary$response_group_primary
+  )
+)
+
+
+cat(
+  "\nNúmero de pacientes incluidos en evaluación principal:",
+  nrow(external_primary),
+  "\n"
+)
+
+
+stopifnot(
+  nrow(external_primary) == 13
+)
+
+stopifnot(
+  sum(
+    external_primary$response_group_primary ==
+      "Responder"
+  ) == 8
+)
+
+stopifnot(
+  sum(
+    external_primary$response_group_primary ==
+      "NonResponder"
+  ) == 5
+)
+
+
+############################################################
+# 30. COMPARACIÓN PRINCIPAL DEL SCORE TRANSCRIPTÓMICO
+#
+# Evaluación externa principal:
+#
+# Responder    = CR / PR
+# NonResponder = PD
+# SD           = excluido
+############################################################
+
+# ----------------------------------------------------------
+# Identificar outliers para su representación gráfica
+#
+# Se utiliza la regla estándar de Tukey:
+# < Q1 - 1.5 × IQR
+# > Q3 + 1.5 × IQR
+#
+# Los outliers se identifican únicamente con fines
+# gráficos y NO se eliminan del análisis estadístico.
+# ----------------------------------------------------------
+
+external_primary_plot <- external_primary %>%
+  group_by(response_group_primary) %>%
+  mutate(
+    Q1 = quantile(signature_score, 0.25, na.rm = TRUE),
+    Q3 = quantile(signature_score, 0.75, na.rm = TRUE),
+    IQR_score = IQR(signature_score, na.rm = TRUE),
+    
+    lower_limit = Q1 - 1.5 * IQR_score,
+    upper_limit = Q3 + 1.5 * IQR_score,
+    
+    is_outlier =
+      signature_score < lower_limit |
+      signature_score > upper_limit
+  ) %>%
+  ungroup()
+
+
+external_score_plot <- ggplot(
+  external_primary_plot,
+  aes(
+    x = response_group_primary,
+    y = signature_score
+  )
+) +
+  
+  # Líneas horizontales que marcan los extremos
+  # de los bigotes
+  stat_boxplot(
+    geom = "errorbar",
+    width = 0.15,
+    linewidth = 0.5,
+    color = "black"
+  ) +
+  
+  # Boxplot sin mostrar automáticamente los outliers
+  geom_boxplot(
+    outlier.shape = NA,
+    fill = "white",
+    color = "black"
+  ) +
+  
+  # Puntos normales con color según grupo
+  geom_point(
+    data = external_primary_plot %>%
+      filter(!is_outlier),
+    aes(
+      color = response_group_primary
+    ),
+    size = 2.5,
+    position = position_jitter(
+      width = 0.12,
+      height = 0,
+      seed = 123
+    )
+  ) +
+  
+  # Outliers en rojo
+  geom_point(
+    data = external_primary_plot %>%
+      filter(is_outlier),
+    size = 2.5,
+    color = "red",
+    position = position_jitter(
+      width = 0.12,
+      height = 0,
+      seed = 123
+    )
+  ) +
+  
+  # Mostrar valor únicamente de los outliers
+  geom_text(
+    data = external_primary_plot %>%
+      filter(is_outlier),
+    aes(
+      label = round(signature_score, 2)
+    ),
+    color = "red",
+    vjust = -1,
+    size = 3.5,
+    position = position_jitter(
+      width = 0.12,
+      height = 0,
+      seed = 123
+    )
+  ) +
+  
+  # Colores de los puntos normales
+  scale_color_manual(
+    values = c(
+      "NonResponder" = "#0072B2",
+      "Responder" = "#009E73"
+    )
+  ) +
+  
+  scale_y_continuous(
+    breaks = seq(-1, 3, by = 0.5),
+    expand = expansion(
+      mult = c(0.02, 0.05)
+    )
+  ) +
+  
+  coord_cartesian(
+    ylim = c(-1, 3.1)
+  ) +
+  
+  labs(
+    title =
+      "Evaluación externa principal de la firma transcriptómica",
+    subtitle =
+      "GSE145996: CR/PR vs PD",
+    x =
+      "Respuesta terapéutica",
+    y =
+      "Score transcriptómico"
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    legend.position = "none"
+  )
+
+
+print(
+  external_score_plot
+)
+
+
+external_score_test <- wilcox.test(
+  signature_score ~ response_group_primary,
+  data = external_primary,
+  exact = FALSE
+)
+
+
+cat(
+  "\nComparación externa principal del score:\n"
+)
+
+print(
+  external_score_test
+)
+
+
+############################################################
+# 31. EVALUACIÓN EXTERNA PRINCIPAL MEDIANTE ROC / AUC
+#
+# CR/PR vs PD
+############################################################
+
+external_primary <- external_primary %>%
+  mutate(
+    
+    response_binary = ifelse(
+      response_group_primary == "Responder",
+      1,
+      0
+    )
+    
+  )
+
+
+stopifnot(
+  length(
+    unique(
+      external_primary$response_binary
+    )
+  ) == 2
+)
+
+
+roc_external <- pROC::roc(
+  
+  response =
+    external_primary$response_binary,
+  
+  predictor =
+    external_primary$signature_score,
+  
+  levels =
+    c(0, 1),
+  
+  direction =
+    "<",
+  
+  ci =
+    TRUE,
+  
+  quiet =
+    TRUE
+)
+
+
+external_auc <- pROC::auc(
+  roc_external
+)
+
+
+external_auc_ci <- pROC::ci.auc(
+  roc_external
+)
+
+
+cat(
+  "\nAUC DE EVALUACIÓN EXTERNA PRINCIPAL:\n"
+)
+
+print(
+  external_auc
+)
+
+
+cat(
+  "\nIC 95% DEL AUC PRINCIPAL:\n"
+)
+
+print(
+  external_auc_ci
+)
+
+
+plot(
+  roc_external,
+  main =
+    "ROC externa principal - GSE145996: CR/PR vs PD"
+)
+
+text(
+  x = 0.25,
+  y = 0.10,
+  labels = "AUC = 0,575 (IC95%: 0,199–0,951)",
+  cex = 1
+)
+
+############################################################
+# 32. ANÁLISIS DE SENSIBILIDAD
+#
+# Se evalúa una definición alternativa basada en respuesta
+# objetiva:
+#
+# CR / PR -> Responder
+# SD / PD -> NonResponder
+#
+# Este análisis incluye los 14 pacientes y NO sustituye
+# la evaluación externa principal.
+############################################################
+
+external_sensitivity <- external_score_df %>%
+  filter(
+    !is.na(response_group_objective)
+  )
+
+
+cat(
+  "\nDistribución del análisis de sensibilidad:\n"
+)
+
+print(
+  table(
+    external_sensitivity$response_group_objective
+  )
+)
+
+
+cat(
+  "\nNúmero de pacientes incluidos:",
+  nrow(external_sensitivity),
+  "\n"
+)
+
+
+stopifnot(
+  nrow(external_sensitivity) == 14
+)
+
+############################################################
+# 32.1. WILCOXON - ANÁLISIS DE SENSIBILIDAD
+############################################################
+
+sensitivity_wilcox <- wilcox.test(
+  signature_score ~ response_group_objective,
+  data = external_sensitivity,
+  exact = FALSE
+)
+
+
+cat(
+  "\nWilcoxon - sensibilidad CR/PR vs SD/PD:\n"
+)
+
+print(
+  sensitivity_wilcox
+)
+
+############################################################
+# 32.2. ROC / AUC - Análisis de sensibilidad
+############################################################
+
+external_sensitivity <- external_sensitivity %>%
+  mutate(
+    
+    response_binary_sensitivity = ifelse(
+      response_group_objective == "Responder",
+      1,
+      0
+    )
+    
+  )
+
+# Comprobar que existen las dos clases
+stopifnot(
+  length(
+    unique(
+      external_sensitivity$response_binary_sensitivity
+    )
+  ) == 2
+)
+
+roc_sensitivity <- pROC::roc(
+  
+  response =
+    external_sensitivity$response_binary_sensitivity,
+  
+  predictor =
+    external_sensitivity$signature_score,
+  
+  levels =
+    c(0, 1),
+  
+  direction =
+    "<",
+  
+  ci =
+    TRUE,
+  
+  quiet =
+    TRUE
+)
+
+
+auc_sensitivity <- pROC::auc(
+  roc_sensitivity
+)
+
+
+auc_sensitivity_ci <- pROC::ci.auc(
+  roc_sensitivity
+)
+
+
+cat(
+  "\nAUC - análisis de sensibilidad:\n"
+)
+
+print(
+  auc_sensitivity
+)
+
+
+cat(
+  "\nIC 95% - análisis de sensibilidad:\n"
+)
+
+print(
+  auc_sensitivity_ci
+)
+
+
+plot(
+  roc_sensitivity,
+  main =
+    "ROC externa - sensibilidad CR/PR vs SD/PD"
+)
+
+
+############################################################
+# 33. EXPORTACIÓN DE RESULTADOS DE EVALUACIÓN EXTERNA
+############################################################
+
+write.csv(
+  external_score_df,
+  "GSE145996_scores_todos_pacientes.csv",
+  row.names = FALSE
+)
+
+
+write.csv(
+  external_primary,
+  "GSE145996_evaluacion_principal_CRPR_vs_PD.csv",
+  row.names = FALSE
+)
+
+
+write.csv(
+  external_sensitivity,
+  "GSE145996_sensibilidad_CRPR_vs_SDPD.csv",
+  row.names = FALSE
+)
+
+
+write.csv(
+  signature_presence_ext,
+  "GSE145996_presencia_genes_firma.csv",
+  row.names = FALSE
+)
+
+
+write.csv(
+  final_signature,
+  "firma_genica_congelada.csv",
+  row.names = FALSE
+)
+
+
+cat(
+  "\n========================================\n"
+)
+
+cat(
+  "EVALUACIÓN EXTERNA FINALIZADA\n"
+)
+
+cat(
+  "========================================\n"
+)
+
+
+cat(
+  "\nPacientes totales GSE145996:",
+  nrow(external_score_df)
+)
+
+
+cat(
+  "\nPacientes análisis principal:",
+  nrow(external_primary)
+)
+
+
+cat(
+  "\nRespondedores análisis principal:",
+  sum(
+    external_primary$response_group_primary ==
+      "Responder"
+  )
+)
+
+
+cat(
+  "\nNonRespondedores análisis principal:",
+  sum(
+    external_primary$response_group_primary ==
+      "NonResponder"
+  )
+)
+
+
+cat(
+  "\nGenes de la firma:",
+  nrow(final_signature)
+)
+
+
+cat(
+  "\nAUC externa principal:",
+  round(
+    as.numeric(external_auc),
+    3
+  )
+)
+
+
+cat(
+  "\nIC 95% AUC principal:",
+  paste(
+    round(
+      as.numeric(external_auc_ci),
+      3
+    ),
+    collapse = " - "
+  )
+)
+
+
+cat(
+  "\nAUC análisis de sensibilidad:",
+  round(
+    as.numeric(auc_sensitivity),
+    3
+  )
+)
+
+
+cat(
+  "\nIC 95% sensibilidad:",
+  paste(
+    round(
+      as.numeric(auc_sensitivity_ci),
+      3
+    ),
+    collapse = " - "
+  ),
+  "\n"
+)
+
+
+############################################################
+# 34. INFORMACIÓN DE REPRODUCIBILIDAD
+############################################################
+
+session_info <- capture.output(
+  sessionInfo()
+)
+
+writeLines(
+  session_info,
+  "sessionInfo_TFM.txt"
+)
+
+############################################################
+# FIN DEL PIPELINE COMPLETO
+############################################################
